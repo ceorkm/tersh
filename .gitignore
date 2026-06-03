@@ -1,0 +1,102 @@
+# build artifacts
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# private project/agent notes
+docs/
+CLAUDE.md
+SPEC.md
+
+# user data (must never be committed)
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.p12
+*.keystore
+*.kdbx
+*.1pux
+wallet.dat
+secrets.json
+secret.json
+.env
+.env*
+.env.local
+.env.*.local
+Library/
+
+# dev-only vault key — see backend/src/vault/crypto.rs `load_or_create_dev_key`.
+# Lives at ~/Library/Application Support/Tersh/.dev-vault-key.b64 at runtime;
+# this pattern catches any stray copy that ends up in-tree.
+.dev-vault-key.b64
+
+# release
+release/
+*.dmg
+*.app
+*.exe
+*.AppImage
+*.deb
+*.rpm
+*.msi
+
+# ── leak hardening (audited 2026-05-31; root rules already cover *.pem *.key
+# id_rsa*/id_dsa*/id_ecdsa*/id_ed25519* *.p12 *.keystore *.kdbx *.1pux
+# wallet.dat secrets.json secret.json .env* *.db *.sqlite* .dev-vault-key.b64) ──
+
+# additional key / certificate formats
+*.ppk
+*.pub
+*.crt
+*.cer
+*.der
+*.pfx
+*.jks
+*.p8
+*.asc
+*.gpg
+
+# credential files & password-manager / secret exports
+secrets.*
+secret.*
+credentials
+credentials.*
+*.credentials
+auth.json
+.netrc
+*.agilekeychain
+*.opvault
+*.bitwarden.json
+*.pem.bak
+*.key.bak
+
+# infrastructure-as-code secret material
+*.tfvars
+*.tfstate
+*.tfstate.*
+.envrc
+kubeconfig
+*.kubeconfig
+
+# TS/build artifacts (can embed local absolute paths + usernames)
+*.tsbuildinfo
+.tsbuildinfo/

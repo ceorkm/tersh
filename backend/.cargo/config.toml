@@ -1,0 +1,13 @@
+# Cargo runner wrapper for macOS — applies a stable ad-hoc code-signing
+# identifier to the dev binary before launching it, so macOS keychain ACLs
+# survive across `cargo build` rebuilds. See scripts/dev-runner.sh for the
+# full explanation.
+#
+# Only macOS targets get the wrapper. Other platforms run cargo's default
+# launch path unchanged.
+
+[target.aarch64-apple-darwin]
+runner = "../scripts/dev-runner.sh"
+
+[target.x86_64-apple-darwin]
+runner = "../scripts/dev-runner.sh"

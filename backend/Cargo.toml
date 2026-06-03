@@ -1,0 +1,77 @@
+[package]
+name = "tersh"
+version = "0.0.0"
+description = "AI-agent-first SSH/SFTP client"
+authors = ["Tersh"]
+license = "AGPL-3.0-only"
+edition = "2021"
+rust-version = "1.77"
+
+# Every version below is exact (no ^/~) per CLAUDE.md §2.1.
+# Every row must be present in docs/security/allowed-deps.md before install.
+
+[lib]
+name = "tersh_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.1", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.1", features = ["unstable"] }
+tauri-plugin-dialog = "=2.6.0"
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.133"
+tokio = { version = "=1.42.0", features = ["macros", "rt-multi-thread", "sync", "io-util", "time", "fs"] }
+russh = "=0.45.0"
+russh-keys = "=0.45.0"
+russh-sftp = "=2.0.8"
+async-trait = "=0.1.83"
+bytes = "=1.9.0"
+futures = "=0.3.31"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+anyhow = "=1.0.93"
+thiserror = "=1.0.69"
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
+zeroize = { version = "=1.8.1", features = ["zeroize_derive"] }
+argon2 = "=0.5.3"
+aes-gcm = "=0.10.3"
+keyring = "=3.6.1"
+portable-pty = "=0.8.1"
+reqwest = { version = "=0.13.3", features = ["json"] }
+getrandom = "=0.3.4"
+
+# macOS-only: present a native NSOpenPanel that can choose files AND folders in
+# one pass (the rfd-backed tauri-plugin-dialog picker can't do both, and an
+# osascript-driven NSOpenPanel never displays). These crates are already in the
+# locked tree transitively (pulled by tao/wry); pinning them as direct deps adds
+# no new download. See docs/security/allowed-deps.md.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSString", "NSURL"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "NSResponder", "NSView", "NSControl", "NSApplication"] }
+
+[features]
+# Tauri custom-protocol is required for production builds (no dev server).
+custom-protocol = ["tauri/custom-protocol"]
+
+[patch.crates-io]
+wry = { path = "vendor/wry-0.55.1" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+# panic = "unwind" (cargo default). We deliberately do NOT use panic = "abort"
+# here: the WKWebView NSDraggingDestination callbacks (vendored wry, see
+# `vendor/wry-0.55.1/src/wkwebview/drag_drop.rs`) wrap each handler in
+# `catch_unwind`, which silently becomes a no-op under panic=abort. Without
+# unwinding a panic anywhere in the drag chain (Tauri's emit closure, an
+# unexpected pasteboard format from the macOS file picker, etc.) aborts the
+# whole process — i.e. the user sees Tersh quit when they drag from inside
+# the file picker. Unwind lets the catch_unwind absorb the panic into a
+# no-op drag instead.
+panic = "unwind"

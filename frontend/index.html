@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <title>Tersh</title>
+    <script>
+      // Boot-time error capture — registered BEFORE the module script runs.
+      // If anything throws during import/module evaluation we paint it to the
+      // DOM instead of staring at a white screen.
+      (function () {
+        function escapeHtml(value) {
+          return String(value || '').replace(/[&<>"']/g, function (ch) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch] || ch;
+          });
+        }
+        function paint(where, msg, stack) {
+          var root = document.getElementById('root') || document.body;
+          if (!root) return;
+          root.innerHTML =
+            '<div style="padding:32px;font-family:ui-monospace,monospace;background:#111;color:#f88;min-height:100vh;">' +
+            '<div style="font-size:13px;opacity:.7;margin-bottom:8px;">tersh failed to start (' + escapeHtml(where) + ')</div>' +
+            '<pre style="font-size:13px;white-space:pre-wrap;color:#fcc;">' + escapeHtml(msg) + '\n' + escapeHtml(stack) + '</pre>' +
+            '</div>';
+        }
+        window.addEventListener('error', function (e) {
+          paint('window.error', e.message, e.error && e.error.stack);
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason || {};
+          paint('unhandled promise', r.message || String(r), r.stack);
+        });
+        // 5s heartbeat: if root has no React content by then, surface it.
+        setTimeout(function () {
+          var r = document.getElementById('root');
+          if (r && r.children.length === 0) {
+            paint('no react mount', 'root element is empty after 5s — no error was caught', '');
+          }
+        }, 5000);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
