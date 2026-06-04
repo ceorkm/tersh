@@ -150,7 +150,10 @@ function CollaboratorThemePanel({ appearance, onChange }: { appearance: Appearan
               >
                 <ThemePreview themeId={t.id} active={active} />
                 <span className="collab-theme-name">{t.name}</span>
-                <span className={"theme-card-pill " + t.mode}>{t.mode}</span>
+                <span className="theme-card-tags">
+                  <span className={"theme-card-pill " + t.mode}>{t.mode}</span>
+                  {t.isNew && <span className="theme-card-pill new">New</span>}
+                </span>
               </button>
             </li>
           );
@@ -1444,7 +1447,10 @@ function AppearancePanel({ appearance, onChange }: { appearance: Appearance; onC
                 <ThemePreview themeId={t.id} active={active} />
                 <div className="theme-card-meta">
                   <span className="theme-card-name">{t.name}</span>
-                  <span className={"theme-card-pill " + t.mode}>{t.mode}</span>
+                  <span className="theme-card-tags">
+                    <span className={"theme-card-pill " + t.mode}>{t.mode}</span>
+                    {t.isNew && <span className="theme-card-pill new">New</span>}
+                  </span>
                 </div>
               </button>
             </li>

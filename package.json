@@ -1,6 +1,6 @@
 {
   "name": "tersh",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Tersh — AI-agent-first SSH/SFTP client. Drag images onto the terminal, the remote AI agent sees them.",
   "private": true,
   "type": "module",

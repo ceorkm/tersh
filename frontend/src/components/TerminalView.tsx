@@ -52,10 +52,15 @@ const DEVICE_ATTRIBUTE_ESCAPE_PREFIX = /^\x1b\[(?:\??[0-9;]*|>[0-9;]*)$/;
 const TERMINAL_EMOJI_GLYPH_FACES = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"';
 const SENSITIVE_PROMPT = /(?:password|passwd|passphrase|pin|otp|mfa|2fa|two[- ]factor|verification code|auth(?:entication)? code|token|secret|credential|api[-_ ]?key|private key|unlock|decrypt|keychain|login|username)[^\r\n]{0,120}[:?]\s*$/i;
 const NORMAL_LOCAL_SHELL_PROMPT = /(?:^|\n)[^\n\r]{0,160}(?:[$%#❯➜λ])\s*$/;
+const AGENT_TUI_MARKER = /\bClaude Code\b|\bCodex\b|\bbypass permissions on\b|\besc to interrupt\b|\bthinking with\b|\bBrewed for\b|\bSymbioting\b/i;
+const NORMAL_SHELL_OUTPUT_MARKER = /\bWelcome to\b|\bLast login:\b|\bSystem information as of\b|(?:^|\n)[^\n\r]{0,160}(?:[$%#❯➜λ])\s*$/i;
 // Bracketed paste: terminals wrap pasted text in these so the shell knows it's
 // a paste (not typed). We capture the content between them as user input.
 const BRACKETED_PASTE_START = "[200~";
 const BRACKETED_PASTE_END = "[201~";
+const TERMINAL_LINE_HEIGHT = 1.0;
+const ACTIVE_AGENT_ROW_REFRESH_INTERVAL_MS = 700;
+const AGENT_TRAILING_RENDER_HEAL_DELAY_MS = 700;
 
 /// Best-effort: read the user's current input from xterm's own buffer (the
 /// logical line at the cursor, with the shell prompt stripped). Used as a
@@ -150,6 +155,10 @@ export function TerminalView({
   const lastFit = useRef<{ cols: number; rows: number } | null>(null);
   const pendingFit = useRef<{ cols: number; rows: number } | null>(null);
   const lastRenderHealAt = useRef(0);
+  const lastActiveAgentRenderHealAt = useRef(0);
+  const activeAgentRenderHealRaf = useRef<number | null>(null);
+  const activeAgentTrailingHealTimer = useRef<number | null>(null);
+  const agentSawAlternateBuffer = useRef(false);
   const fitting = useRef(false);
   const unlisteners = useRef<Array<() => void>>([]);
   const dropUnlisten = useRef<(() => void) | null>(null);
@@ -191,6 +200,7 @@ export function TerminalView({
 
   useEffect(() => {
     agentImagePasteCapable.current = false;
+    agentSawAlternateBuffer.current = false;
     recentOutput.current = "";
   }, [tab.id, sessionId]);
   const activeRef = useRef(active);
@@ -219,6 +229,14 @@ export function TerminalView({
         window.clearTimeout(restoreTimer.current);
         restoreTimer.current = null;
       }
+      if (activeAgentRenderHealRaf.current !== null) {
+        cancelAnimationFrame(activeAgentRenderHealRaf.current);
+        activeAgentRenderHealRaf.current = null;
+      }
+      if (activeAgentTrailingHealTimer.current !== null) {
+        window.clearTimeout(activeAgentTrailingHealTimer.current);
+        activeAgentTrailingHealTimer.current = null;
+      }
       for (const timer of transferDismissTimers.current.values()) {
         window.clearTimeout(timer);
       }
@@ -236,6 +254,84 @@ export function TerminalView({
       _core?: { _renderService?: { clear?: () => void } };
     })._core;
     core?._renderService?.clear?.();
+  };
+
+  const forceRendererRows = (term: Terminal, start: number, end: number) => {
+    const core = (term as unknown as {
+      _core?: {
+        _renderService?: {
+          _renderer?: { value?: { renderRows?: (start: number, end: number) => void } };
+        };
+      };
+    })._core;
+    const renderRows = core?._renderService?._renderer?.value?.renderRows;
+    if (renderRows) {
+      renderRows.call(core?._renderService?._renderer?.value, start, end);
+      return;
+    }
+    term.refresh(start, end);
+  };
+
+  const scheduleRendererHeal = (term: Terminal, minIntervalMs: number) => {
+    const now = Date.now();
+    if (now - lastActiveAgentRenderHealAt.current < minIntervalMs) return;
+    if (activeAgentRenderHealRaf.current !== null) return;
+    lastActiveAgentRenderHealAt.current = now;
+
+    activeAgentRenderHealRaf.current = requestAnimationFrame(() => {
+      activeAgentRenderHealRaf.current = null;
+      const currentTerm = termRef.current;
+      if (!currentTerm || !activeRef.current || currentTerm !== term) return;
+      forceRendererClear(currentTerm);
+      currentTerm.refresh(0, currentTerm.rows - 1);
+    });
+  };
+
+  const scheduleAgentRowRefresh = (term: Terminal, minIntervalMs: number) => {
+    const now = Date.now();
+    if (now - lastActiveAgentRenderHealAt.current < minIntervalMs) return;
+    if (activeAgentRenderHealRaf.current !== null) return;
+    lastActiveAgentRenderHealAt.current = now;
+
+    activeAgentRenderHealRaf.current = requestAnimationFrame(() => {
+      activeAgentRenderHealRaf.current = null;
+      const currentTerm = termRef.current;
+      if (!currentTerm || !activeRef.current || currentTerm !== term) return;
+      if (!agentImagePasteCapable.current || currentTerm.buffer.active.type !== "alternate") return;
+      forceRendererRows(currentTerm, 0, currentTerm.rows - 1);
+    });
+  };
+
+  const scheduleTrailingAgentRenderHeal = () => {
+    const term = termRef.current;
+    if (!term || !activeRef.current || !agentImagePasteCapable.current) return;
+    if (term.buffer.active.type !== "alternate") return;
+    if (activeAgentTrailingHealTimer.current !== null) {
+      window.clearTimeout(activeAgentTrailingHealTimer.current);
+    }
+    activeAgentTrailingHealTimer.current = window.setTimeout(() => {
+      activeAgentTrailingHealTimer.current = null;
+      const currentTerm = termRef.current;
+      if (!currentTerm || !activeRef.current || currentTerm !== term) return;
+      if (!agentImagePasteCapable.current || currentTerm.buffer.active.type !== "alternate") return;
+      scheduleAgentRowRefresh(currentTerm, 0);
+    }, AGENT_TRAILING_RENDER_HEAL_DELAY_MS);
+  };
+
+  const healActiveAgentRenderIfNeeded = () => {
+    const term = termRef.current;
+    if (!term || !activeRef.current || !agentImagePasteCapable.current) return;
+    if (term.buffer.active.type !== "alternate") {
+      if (agentSawAlternateBuffer.current && NORMAL_SHELL_OUTPUT_MARKER.test(recentOutput.current)) {
+        agentSawAlternateBuffer.current = false;
+        scheduleRendererHeal(term, 0);
+      }
+      return;
+    }
+    if (term.rows <= 0) return;
+    agentSawAlternateBuffer.current = true;
+    scheduleAgentRowRefresh(term, ACTIVE_AGENT_ROW_REFRESH_INTERVAL_MS);
+    scheduleTrailingAgentRenderHeal();
   };
 
   const shouldSendResize = (
@@ -391,7 +487,7 @@ export function TerminalView({
       letterSpacing: 0,
       fontWeight: 500,
       fontWeightBold: 700,
-      lineHeight: 1.08,
+      lineHeight: TERMINAL_LINE_HEIGHT,
     });
     const unicodeGraphemes = new UnicodeGraphemesAddon();
     const fit = new FitAddon();
@@ -469,6 +565,9 @@ export function TerminalView({
 
     termRef.current = term;
     fitRef.current = fit;
+    const writeParsedDisposable = term.onWriteParsed(() => {
+      healActiveAgentRenderIfNeeded();
+    });
     if (activeRef.current) activateThisTerminal();
     const focusHandler = () => {
       if (activeRef.current) onFocusRequest?.();
@@ -540,6 +639,15 @@ export function TerminalView({
         window.clearTimeout(restoreTimer.current);
         restoreTimer.current = null;
       }
+      if (activeAgentRenderHealRaf.current !== null) {
+        cancelAnimationFrame(activeAgentRenderHealRaf.current);
+        activeAgentRenderHealRaf.current = null;
+      }
+      if (activeAgentTrailingHealTimer.current !== null) {
+        window.clearTimeout(activeAgentTrailingHealTimer.current);
+        activeAgentTrailingHealTimer.current = null;
+      }
+      writeParsedDisposable.dispose();
       term.dispose();
       container.removeEventListener("focusin", focusHandler);
       termRef.current = null;
@@ -584,7 +692,7 @@ export function TerminalView({
       : outputDecoder.current.decode(chunk.length > TAIL ? chunk.subarray(chunk.length - TAIL) : chunk);
     if (!text) return;
     const normalized = stripTerminalControls(text);
-    if (/\bClaude Code\b|\bCodex\b/i.test(normalized)) {
+    if (AGENT_TUI_MARKER.test(normalized)) {
       agentImagePasteCapable.current = true;
     }
     recentOutput.current = (recentOutput.current + normalized).slice(-500);
@@ -826,7 +934,7 @@ export function TerminalView({
 
   const localAgentAcceptsImagePaste = () => {
     const output = recentOutput.current;
-    return agentImagePasteCapable.current || /\bClaude Code\b|\bCodex\b/i.test(output);
+    return agentImagePasteCapable.current || AGENT_TUI_MARKER.test(output);
   };
 
   const insertLocalDroppedPaths = async (sid: string, paths: string[]) => {
@@ -884,8 +992,8 @@ export function TerminalView({
     if (term.options.fontWeightBold !== 700) {
       term.options.fontWeightBold = 700;
     }
-    if (term.options.lineHeight !== 1.08) {
-      term.options.lineHeight = 1.08;
+    if (term.options.lineHeight !== TERMINAL_LINE_HEIGHT) {
+      term.options.lineHeight = TERMINAL_LINE_HEIGHT;
       shouldRefit = true;
     }
     if (activeRef.current && shouldRefit) {

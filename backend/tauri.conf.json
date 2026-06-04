@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Tersh",
-  "version": "0.0.0",
-  "identifier": "dev.tersh.app",
+  "version": "0.1.0",
+  "identifier": "com.rkmlabs.tersh",
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:1420",

@@ -6,6 +6,9 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 
+# local video output (launch-video experiments, not shipped)
+videos/
+
 # OS
 .DS_Store
 Thumbs.db

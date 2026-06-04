@@ -995,9 +995,20 @@ div.brand-mark {
   width: 100%;
   height: 100%;
   font-family: var(--term-font);
+  font-feature-settings: "liga" 0, "calt" 0;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   padding: 0;
   box-sizing: border-box;
   color: var(--term-fg);
+}
+.term-mount .xterm-screen {
+  font-family: var(--term-font) !important;
+  font-variant-ligatures: none;
+}
+.term-mount .xterm-screen .xterm-char {
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 .term-mount .xterm-viewport {
   background-color: inherit;
@@ -3340,6 +3351,12 @@ code.drow-sub { background: transparent; padding: 0; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .theme-card.active .theme-card-name { color: var(--text-bright); font-weight: 600; }
+.theme-card-tags {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
 .theme-card-pill {
   align-self: flex-start;
   font-size: 9px; padding: 1px 6px; border-radius: var(--r-pill);
@@ -3347,6 +3364,11 @@ code.drow-sub { background: transparent; padding: 0; }
   color: var(--text-dim);
   text-transform: uppercase; font-weight: 700; letter-spacing: 0.06em;
   border: 1px solid var(--border-subtle);
+}
+.theme-card-pill.new {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
 }
 .theme-card.active .theme-card-pill {
   color: var(--accent);
@@ -3593,6 +3615,9 @@ code.drow-sub { background: transparent; padding: 0; }
 .collab-theme-chip .theme-card-pill {
   font-size: 8px;
   padding: 1px 5px;
+}
+.collab-theme-chip .theme-card-tags {
+  justify-content: center;
 }
 
 .shell.collaborator-session .tab,

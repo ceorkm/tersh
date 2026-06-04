@@ -25,6 +25,7 @@ export interface Theme {
   id: string;
   name: string;
   mode: "dark" | "light";
+  isNew?: boolean;
   tokens: UiTokens;
   xterm: XtermPalette;
 }
@@ -58,11 +59,23 @@ const mkXterm = (t: UiTokens, extra: Partial<XtermPalette> = {}): XtermPalette =
   ...extra,
 });
 
-const dark = (id: string, name: string, tokens: UiTokens, xtermOverrides: Partial<XtermPalette> = {}): Theme =>
-  ({ id, name, mode: "dark", tokens, xterm: mkXterm(tokens, xtermOverrides) });
+const dark = (
+  id: string,
+  name: string,
+  tokens: UiTokens,
+  xtermOverrides: Partial<XtermPalette> = {},
+  meta: Pick<Partial<Theme>, "isNew"> = {},
+): Theme =>
+  ({ id, name, mode: "dark", ...meta, tokens, xterm: mkXterm(tokens, xtermOverrides) });
 
-const light = (id: string, name: string, tokens: UiTokens, xtermOverrides: Partial<XtermPalette> = {}): Theme =>
-  ({ id, name, mode: "light", tokens, xterm: mkXterm(tokens, xtermOverrides) });
+const light = (
+  id: string,
+  name: string,
+  tokens: UiTokens,
+  xtermOverrides: Partial<XtermPalette> = {},
+  meta: Pick<Partial<Theme>, "isNew"> = {},
+): Theme =>
+  ({ id, name, mode: "light", ...meta, tokens, xterm: mkXterm(tokens, xtermOverrides) });
 
 const legacyThemePrefix = ["ter", "mius"].join("");
 export const LEGACY_THEME_IDS: Record<string, string> = {
@@ -100,6 +113,39 @@ export const THEMES: Theme[] = [
     ansiMagenta: "#8250df", ansiCyan: "#1b7c83", ansiRed: "#cf222e",
     shadowSm: "0 1px 0 rgba(15,20,30,.04)", shadowMd: "0 2px 12px rgba(15,20,30,.08)",
   }),
+  dark("vesper", "Vesper", {
+    bg: "#101010", bgElev: "#171717", bgHover: "#242424", bgCanvas: "#0b0b0b", bgSelected: "#ffc7991a", bgFrosted: "rgba(23,23,23,.88)",
+    text: "#f3f3f3", textDim: "#8b8b8b", textBright: "#ffffff",
+    border: "#292929", borderStrong: "#3a3a3a", borderSubtle: "#1f1f1f",
+    accent: "#ffc799", accentText: "#101010", accentSoft: "#ffc7992b",
+    danger: "#ff8080", ok: "#99ffe4", warning: "#ffc799",
+    termBg: "#101010", termFg: "#f3f3f3",
+    ansiGreen: "#99ffe4", ansiYellow: "#ffc799", ansiBlue: "#8eecf7",
+    ansiMagenta: "#ffc0f3", ansiCyan: "#8eecf7", ansiRed: "#ff8080",
+    shadowSm: "0 1px 0 rgba(0,0,0,.5)", shadowMd: "0 2px 12px rgba(0,0,0,.42)",
+  }, {}, { isNew: true }),
+  dark("cobalt-kernel", "Cobalt Kernel", {
+    bg: "#101827", bgElev: "#162238", bgHover: "#20304d", bgCanvas: "#0b1220", bgSelected: "#64d2ff1a", bgFrosted: "rgba(22,34,56,.88)",
+    text: "#d7e4ff", textDim: "#8491aa", textBright: "#f8fbff",
+    border: "#263652", borderStrong: "#38506f", borderSubtle: "#1b2940",
+    accent: "#64d2ff", accentText: "#08111f", accentSoft: "#64d2ff2b",
+    danger: "#ff7a90", ok: "#83f7b5", warning: "#f7c66a",
+    termBg: "#101827", termFg: "#d7e4ff",
+    ansiGreen: "#83f7b5", ansiYellow: "#f7c66a", ansiBlue: "#64d2ff",
+    ansiMagenta: "#c79bff", ansiCyan: "#67e8f9", ansiRed: "#ff7a90",
+    shadowSm: "0 1px 0 rgba(0,0,0,.45)", shadowMd: "0 2px 14px rgba(7,13,24,.45)",
+  }, {}, { isNew: true }),
+  light("paper-trail", "Paper Trail", {
+    bg: "#fbfaf6", bgElev: "#f2f0ea", bgHover: "#e8e5dc", bgCanvas: "#efede6", bgSelected: "#2f6fed14", bgFrosted: "rgba(251,250,246,.88)",
+    text: "#20242c", textDim: "#69717d", textBright: "#0e1116",
+    border: "#dedad1", borderStrong: "#c4bfb3", borderSubtle: "#e9e5dc",
+    accent: "#2f6fed", accentText: "#ffffff", accentSoft: "#2f6fed20",
+    danger: "#c84d5f", ok: "#2b8a5f", warning: "#a46b18",
+    termBg: "#fbfaf6", termFg: "#20242c",
+    ansiGreen: "#2b8a5f", ansiYellow: "#a46b18", ansiBlue: "#2f6fed",
+    ansiMagenta: "#8f5ad7", ansiCyan: "#1d7f8c", ansiRed: "#c84d5f",
+    shadowSm: "0 1px 0 rgba(25,25,20,.04)", shadowMd: "0 2px 12px rgba(25,25,20,.08)",
+  }, {}, { isNew: true }),
   dark("kanagawa-wave", "Kanagawa Wave", {
     bg: "#1f1f28", bgElev: "#2a2a37", bgHover: "#363646", bgCanvas: "#16161d", bgSelected: "#7e9cd81f", bgFrosted: "rgba(31,31,40,.85)",
     text: "#dcd7ba", textDim: "#727169", textBright: "#c8c093",
