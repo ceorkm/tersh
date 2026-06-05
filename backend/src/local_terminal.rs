@@ -1,6 +1,6 @@
 use crate::errors::{AppError, AppResult};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -74,6 +74,7 @@ impl LocalTerminalSession {
         let mut cmd = CommandBuilder::new(shell.clone());
         cmd.env("SHELL", &shell);
         cmd.env("TERM", "xterm-256color");
+        cmd.env("PATH", terminal_like_path());
         // GUI-launched macOS apps often start without a UTF-8 locale. zsh's
         // line editor then treats newer emoji as unprintable and renders them
         // as <0001f972>-style placeholders. A real terminal starts shells with
@@ -316,6 +317,47 @@ fn env_locale_is_utf8(key: &str) -> bool {
             normalized.contains("UTF-8") || normalized.contains("UTF8")
         })
         .unwrap_or(false)
+}
+
+fn terminal_like_path() -> String {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+
+    if let Ok(path) = std::env::var("PATH") {
+        for entry in path.split(':') {
+            push_path_entry(&mut entries, &mut seen, entry);
+        }
+    }
+
+    for entry in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        push_path_entry(&mut entries, &mut seen, entry);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        for suffix in [".local/bin", ".cargo/bin", ".bun/bin", "Library/pnpm"] {
+            let entry = Path::new(&home).join(suffix);
+            push_path_entry(&mut entries, &mut seen, &entry.to_string_lossy());
+        }
+    }
+
+    entries.join(":")
+}
+
+fn push_path_entry(entries: &mut Vec<String>, seen: &mut HashSet<String>, entry: &str) {
+    let entry = entry.trim();
+    if entry.is_empty() || !seen.insert(entry.to_string()) {
+        return;
+    }
+    entries.push(entry.to_string());
 }
 
 fn pick_local_shell() -> String {

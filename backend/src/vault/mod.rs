@@ -1185,15 +1185,16 @@ pub struct SessionLogRow {
 }
 
 /// Refuse to start a second tersh instance if the existing lockfile still
-/// points at a live process. The lockfile contains the owning process's PID;
-/// a stale PID (process gone) is taken over automatically.
+/// points at a live tersh process. The lockfile contains the owning process's
+/// PID; a stale PID (process gone or reused by another executable) is taken
+/// over automatically.
 fn ensure_single_instance(lock_path: &Path) -> AppResult<()> {
     let our_pid = std::process::id();
 
     // If lock exists and the recorded PID is alive AND isn't us, abort.
     if let Ok(contents) = std::fs::read_to_string(lock_path) {
         if let Ok(other_pid) = contents.trim().parse::<u32>() {
-            if other_pid != our_pid && pid_is_alive(other_pid) {
+            if other_pid != our_pid && pid_is_tersh_instance(other_pid) {
                 return Err(AppError::Vault(format!(
                     "another tersh instance is already running (pid {other_pid}). \
                      close it, or remove {} if you're sure no tersh is running.",
@@ -1211,19 +1212,35 @@ fn ensure_single_instance(lock_path: &Path) -> AppResult<()> {
 }
 
 #[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
+fn pid_is_tersh_instance(pid: u32) -> bool {
     // `kill -0 PID` exits 0 if the process exists and is signalable, non-zero
-    // otherwise. Avoids needing the libc crate (which would require a dep
-    // review per CLAUDE.md §3.1). One-time startup cost, irrelevant for perf.
-    std::process::Command::new("kill")
+    // otherwise. A stale lock can also point at a PID macOS has since reused
+    // for another process, so confirm the executable basename before blocking.
+    let alive = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !alive {
+        return false;
+    }
+
+    let output = match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return true,
+    };
+    let command = String::from_utf8_lossy(&output.stdout);
+    let Some(name) = Path::new(command.trim()).file_name().and_then(|s| s.to_str()) else {
+        return true;
+    };
+    name.eq_ignore_ascii_case("tersh")
 }
 
 #[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
+fn pid_is_tersh_instance(_pid: u32) -> bool {
     // Conservative on non-Unix: assume alive so we don't blow away a real lock.
     true
 }
