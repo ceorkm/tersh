@@ -1165,7 +1165,7 @@ export function TerminalView({
             const accepted: string[] = [];
             for (const path of paths) {
               if (pathLooksSensitive(path)) {
-                enqueueWrite(`\r\n\x1b[31m[upload blocked: sensitive file]\x1b[0m\r\n`);
+                showTransferFailure(basenameOf(path), "Blocked: sensitive file");
                 continue;
               }
               accepted.push(path);
@@ -1271,7 +1271,6 @@ export function TerminalView({
             ? { ...t, done: true, failed: message }
             : t,
         ));
-        enqueueWrite(`\r\n\x1b[31m[upload failed: ${message}]\x1b[0m\r\n`);
       });
   };
 
@@ -1329,6 +1328,16 @@ export function TerminalView({
     transferDismissTimers.current.set(id, timer);
   };
 
+  const showTransferFailure = (name: string, message: string) => {
+    if (disposed.current) return;
+    const id = crypto.randomUUID();
+    setTransfers(prev => [
+      ...prev,
+      { id, name, bytesDone: 0, total: 0, done: true, failed: message },
+    ]);
+    scheduleTransferDismiss(id, 4500);
+  };
+
   const dismissTransfer = (id: string) => {
     if (disposed.current) return;
     const prior = transferDismissTimers.current.get(id);
@@ -1363,14 +1372,14 @@ export function TerminalView({
     try {
       picked = await api.pickUploadsAny();
     } catch (err) {
-      enqueueWrite(`\r\n\x1b[31m[picker failed: ${redactLocalPaths(String(err))}]\x1b[0m\r\n`);
+      showTransferFailure("Upload", redactLocalPaths(String(err)));
       return;
     }
     const accepted: Array<{ localPath: string; transferId: string; isDir?: boolean }> = [];
     for (const item of picked) {
       const looksSensitive = !item.is_dir && pathLooksSensitive(item.local_path);
       if (looksSensitive) {
-        enqueueWrite(`\r\n\x1b[31m[upload blocked: sensitive file]\x1b[0m\r\n`);
+        showTransferFailure(basenameOf(item.local_path), "Blocked: sensitive file");
         continue;
       }
       accepted.push({

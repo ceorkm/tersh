@@ -1,4 +1,5 @@
 import { LayoutGrid, Key, Cable, Code2, ShieldCheck, Folder } from "lucide-react";
+import { api } from "../lib/api";
 import type { SidebarSection } from "../types";
 
 interface Props {
@@ -43,19 +44,18 @@ export function Sidebar({ active, onSelect }: Props) {
         <p className="sidebar-alpha-note">
           Early preview. You may hit bugs; please create an issue when something feels off.
         </p>
-        <a
+        <button
+          type="button"
           className="sidebar-maker"
-          href="https://x.com/ceorkm"
-          target="_blank"
-          rel="noreferrer"
           title="Open ceorkm on X"
+          onClick={() => { void api.openExternalUrl("https://x.com/ceorkm"); }}
         >
           <span>Made with</span>
           <span className="sidebar-heart" aria-hidden="true">♥</span>
           <span>by</span>
           <img src="/brand/ceorkm.jpg" alt="" />
           <span className="sidebar-maker-name">ceorkm</span>
-        </a>
+        </button>
       </div>
     </aside>
   );

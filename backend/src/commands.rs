@@ -14,6 +14,8 @@ use tauri::ipc::{Channel as IpcChannel, InvokeBody, InvokeResponseBody, Request}
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
+const LARGE_TRANSFER_ATTEMPTS: usize = 12;
+
 #[tauri::command]
 pub async fn list_hosts(state: State<'_, AppState>) -> AppResult<Vec<HostRow>> {
     let vault = state.vault.lock().await;
@@ -337,6 +339,17 @@ async fn connect_transfer_sftp_for_session(
     let host_id = state.sessions.host_id_for_session(session_id).await?;
     let (params, jump) = transfer_connect_params_for_host(state, &host_id).await?;
     SshSession::connect_sftp_only(app, state.vault.clone(), params, jump).await
+}
+
+fn upload_error_is_retryable(err: &AppError) -> bool {
+    match err {
+        AppError::Sftp(message) | AppError::Ssh(message) => {
+            !message.contains("upload cancelled")
+                && !message.contains("local path is not")
+                && !message.contains("sensitive_path:")
+        }
+        _ => false,
+    }
 }
 
 fn get_key_passphrase(key_id: &str) -> AppResult<String> {
@@ -871,16 +884,68 @@ pub async fn sftp_upload_local(
                 return Err(e);
             }
         };
-    let upload = sftp::upload_to_agent_dir(
-        transfer_sftp.sftp(),
-        &canonical_local_path,
-        &upload_dir,
-        upload_dir_is_agent_cwd,
-        progress,
-        cancel_flag,
-    )
-    .await;
-    let disconnect_result = transfer_sftp.disconnect().await;
+    let mut transfer_sftp = Some(transfer_sftp);
+    let prepared =
+        match sftp::prepare_upload_to_agent_dir(
+            transfer_sftp.as_ref().expect("transfer sftp exists").sftp(),
+            &canonical_local_path,
+            &upload_dir,
+        ).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                if let Some(transfer_sftp) = transfer_sftp.take() {
+                    let _ = transfer_sftp.disconnect().await;
+                }
+                if let Some(id) = transfer_id.as_ref() {
+                    state.transfers.unregister(id).await;
+                }
+                return Err(e);
+            }
+        };
+    let mut upload = Err(AppError::Internal("upload did not start".into()));
+    for attempt in 0..LARGE_TRANSFER_ATTEMPTS {
+        let is_final_attempt = attempt + 1 == LARGE_TRANSFER_ATTEMPTS;
+        upload = sftp::upload_prepared_file(
+            transfer_sftp.as_ref().expect("transfer sftp exists").sftp(),
+            &canonical_local_path,
+            &prepared,
+            upload_dir_is_agent_cwd,
+            progress.clone(),
+            cancel_flag.clone(),
+            is_final_attempt,
+        )
+        .await;
+        match &upload {
+            Ok(_) => break,
+            Err(e) if !is_final_attempt && upload_error_is_retryable(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    remote_path = %prepared.remote_path,
+                    "resumable drag-drop upload attempt failed; reconnecting: {e}"
+                );
+                if let Some(transfer_sftp) = transfer_sftp.take() {
+                    let _ = transfer_sftp.disconnect().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    750_u64.saturating_mul((attempt as u64 + 1).min(6)),
+                ))
+                .await;
+                transfer_sftp = match connect_transfer_sftp_for_session(app.clone(), &state, &session_id).await {
+                    Ok(next) => Some(next),
+                    Err(connect_err) => {
+                        upload = Err(connect_err);
+                        break;
+                    }
+                };
+            }
+            Err(_) => break,
+        }
+    }
+    let disconnect_result = if let Some(transfer_sftp) = transfer_sftp.take() {
+        transfer_sftp.disconnect().await
+    } else {
+        Ok(())
+    };
     if let Some(id) = transfer_id.as_ref() {
         state.transfers.unregister(id).await;
     }
@@ -3571,19 +3636,63 @@ pub async fn sftp_upload_to(
         None
     };
     let progress = transfer_id.clone().map(|id| (app.clone(), id));
-    let result = match session.acquire_sftp().await {
-        Ok(guard) => {
-            sftp::upload_to_path_with_sftp(
-                guard.sftp(),
-                &canonical_local_path,
-                &remote_path,
-                progress,
-                cancel_flag,
-            )
-            .await
+    let prepared = {
+        let guard = match session.acquire_sftp().await {
+            Ok(guard) => guard,
+            Err(e) => {
+                if let Some(id) = transfer_id.as_ref() {
+                    state.transfers.unregister(id).await;
+                }
+                return Err(e);
+            }
+        };
+        match sftp::prepare_upload_to_path_with_sftp(guard.sftp(), &canonical_local_path, &remote_path).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                if let Some(id) = transfer_id.as_ref() {
+                    state.transfers.unregister(id).await;
+                }
+                return Err(e);
+            }
         }
-        Err(e) => Err(e),
     };
+    let mut result = Err(AppError::Internal("upload did not start".into()));
+    for attempt in 0..LARGE_TRANSFER_ATTEMPTS {
+        let is_final_attempt = attempt + 1 == LARGE_TRANSFER_ATTEMPTS;
+        let guard = match session.acquire_sftp().await {
+            Ok(guard) => guard,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
+        result = sftp::upload_to_path_prepared_with_sftp(
+            guard.sftp(),
+            &canonical_local_path,
+            &prepared,
+            progress.clone(),
+            cancel_flag.clone(),
+            is_final_attempt,
+        )
+        .await;
+        drop(guard);
+        match &result {
+            Ok(_) => break,
+            Err(e) if !is_final_attempt && upload_error_is_retryable(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    remote_path = %prepared.remote_path,
+                    "resumable sftp upload attempt failed; reopening sftp: {e}"
+                );
+                session.invalidate_sftp().await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    750_u64.saturating_mul((attempt as u64 + 1).min(6)),
+                ))
+                .await;
+            }
+            Err(_) => break,
+        }
+    }
     if let Some(id) = transfer_id.as_ref() {
         state.transfers.unregister(id).await;
     }
@@ -4032,6 +4141,51 @@ pub async fn reveal_in_finder(path: String) -> AppResult<()> {
             .status()
             .await
             .map_err(|e| AppError::Internal(format!("xdg-open failed: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Open a trusted external URL in the user's default browser. Plain anchors
+/// with `target=_blank` are unreliable inside Tauri's WKWebView; route these
+/// rare external links through the OS instead.
+#[tauri::command]
+pub async fn open_external_url(url: String) -> AppResult<()> {
+    if url.contains('\0') {
+        return Err(AppError::Invalid("url contains a NUL byte".into()));
+    }
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err(AppError::Invalid("only http(s) URLs can be opened".into()));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(AppError::Invalid("url contains whitespace".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        tokio::process::Command::new("open")
+            .arg(trimmed)
+            .status()
+            .await
+            .map_err(|e| AppError::Internal(format!("open url failed: {e}")))?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .status()
+            .await
+            .map_err(|e| AppError::Internal(format!("start url failed: {e}")))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        tokio::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .status()
+            .await
+            .map_err(|e| AppError::Internal(format!("xdg-open url failed: {e}")))?;
         Ok(())
     }
 }

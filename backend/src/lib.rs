@@ -124,6 +124,7 @@ pub fn run() {
             commands::save_file_dialog,
             commands::default_download_path,
             commands::reveal_in_finder,
+            commands::open_external_url,
             commands::diag_log,
             commands::update_host,
             commands::export_vault,

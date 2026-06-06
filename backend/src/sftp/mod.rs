@@ -3,11 +3,12 @@ use crate::ssh::SshSession;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use std::path::{Path, PathBuf};
+use std::io::SeekFrom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// 256 KB chunk — about 4× the SFTP packet size, big enough to keep the wire
 /// saturated without buffering more than necessary in memory.
@@ -21,7 +22,6 @@ const PROGRESS_EVERY_BYTES: u64 = 1024 * 1024;
 /// (upload/download) intentionally don't use this — they're long-running by
 /// design and should be cancelled explicitly via the transfer queue.
 const SFTP_OP_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
 async fn with_timeout<F, T>(label: &str, fut: F) -> AppResult<T>
 where
@@ -273,6 +273,7 @@ async fn unique_remote_child_path(
 ///
 /// SECURITY: caller canonicalizes and validates the local path immediately
 /// before passing it here.
+#[allow(dead_code)]
 pub async fn upload_to_agent_dir(
     sftp: &SftpSession,
     local_path: &str,
@@ -281,6 +282,32 @@ pub async fn upload_to_agent_dir(
     progress: Option<(AppHandle, String)>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> AppResult<UploadResult> {
+    let prepared = prepare_upload_to_agent_dir(sftp, local_path, upload_dir).await?;
+    upload_prepared_file(
+        sftp,
+        local_path,
+        &prepared,
+        upload_dir_is_agent_cwd,
+        progress,
+        cancel,
+        true,
+    )
+    .await
+}
+
+#[derive(Clone)]
+pub struct PreparedUpload {
+    pub remote_path: String,
+    remote_name: String,
+    temp_path: String,
+    total_size: u64,
+}
+
+pub async fn prepare_upload_to_agent_dir(
+    sftp: &SftpSession,
+    local_path: &str,
+    upload_dir: &str,
+) -> AppResult<PreparedUpload> {
     // 1. Sanity-check local file.
     let meta = tokio::fs::metadata(local_path)
         .await
@@ -288,11 +315,7 @@ pub async fn upload_to_agent_dir(
     if !meta.is_file() {
         return Err(AppError::Invalid("local path is not a file".into()));
     }
-    let size = meta.len();
-    if size > MAX_UPLOAD_BYTES {
-        return Err(AppError::Invalid("file exceeds 1 GiB limit".into()));
-    }
-    let total_size = size;
+    let total_size = meta.len();
 
     // 2. Compute remote path from the caller-provided upload dir. Prefer the
     // detected agent cwd when available; otherwise callers can pass a neutral
@@ -318,20 +341,62 @@ pub async fn upload_to_agent_dir(
     let (remote_path, remote_name) =
         unique_remote_child_path(sftp, &canonical_session_dir, &safe_basename).await?;
 
-    // 4. Stream local → remote via the same `.tersh-upload` temp file +
-    // atomic rename pattern as upload_to_path. On cancel/error the temp
-    // file is removed so the remote never sees a truncated final file.
     let temp_path = format!(
         "{remote_path}.{}.tersh-upload",
         uuid::Uuid::new_v4().simple()
     );
+    Ok(PreparedUpload {
+        remote_path,
+        remote_name,
+        temp_path,
+        total_size,
+    })
+}
+
+/// Continue a prepared single-file upload. If a previous attempt left the
+/// staging file behind, the next attempt resumes from its current remote size.
+/// The final path is only published after the whole file lands cleanly.
+pub async fn upload_prepared_file(
+    sftp: &SftpSession,
+    local_path: &str,
+    prepared: &PreparedUpload,
+    upload_dir_is_agent_cwd: bool,
+    progress: Option<(AppHandle, String)>,
+    cancel: Option<Arc<AtomicBool>>,
+    cleanup_on_error: bool,
+) -> AppResult<UploadResult> {
+    let remote_path = prepared.remote_path.clone();
+    let temp_path = prepared.temp_path.clone();
+    let total_size = prepared.total_size;
+
+    let mut resume_from = match sftp.metadata(&temp_path).await {
+        Ok(attrs) => attrs.size.unwrap_or(0).min(total_size),
+        Err(_) => 0,
+    };
+    if resume_from > total_size {
+        let _ = tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.remove_file(&temp_path)).await;
+        resume_from = 0;
+    }
+
     let mut local_file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| AppError::Sftp(format!("open local: {e}")))?;
+    if resume_from > 0 {
+        local_file
+            .seek(SeekFrom::Start(resume_from))
+            .await
+            .map_err(|e| AppError::Sftp(format!("seek local upload source: {e}")))?;
+    }
+
+    let open_flags = if resume_from == 0 {
+        OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
+    } else {
+        OpenFlags::CREATE | OpenFlags::WRITE
+    };
     let open_fut = async {
         sftp.open_with_flags(
             &temp_path,
-            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            open_flags,
         )
         .await
         .map_err(|e| AppError::Sftp(format!("open remote {temp_path}: {e}")))
@@ -340,10 +405,19 @@ pub async fn upload_to_agent_dir(
         Ok(f) => f,
         Err(e) => return Err(e),
     };
+    if resume_from > 0 {
+        remote_file
+            .seek(SeekFrom::Start(resume_from))
+            .await
+            .map_err(|e| AppError::Sftp(format!("seek remote {temp_path}: {e}")))?;
+    }
 
     let mut buf = vec![0u8; TRANSFER_BUF];
-    let mut total = 0u64;
-    let mut next_emit = PROGRESS_EVERY_BYTES;
+    let mut total = resume_from;
+    let mut next_emit = total.saturating_add(PROGRESS_EVERY_BYTES);
+    if total > 0 {
+        emit_progress(progress.as_ref(), &remote_path, total, total_size, false);
+    }
     let result: AppResult<()> = loop {
         if let Some(ref c) = cancel {
             if c.load(Ordering::Acquire) {
@@ -371,7 +445,7 @@ pub async fn upload_to_agent_dir(
     // If we placed the file directly in the agent's CWD, the bare filename is
     // the most natural reference in the prompt. For neutral inbox uploads we
     // must return the absolute path so the agent can find it from any folder.
-    let agent_relative_name = upload_dir_is_agent_cwd.then_some(remote_name);
+    let agent_relative_name = upload_dir_is_agent_cwd.then_some(prepared.remote_name.clone());
 
     match result {
         Ok(()) => {
@@ -405,7 +479,9 @@ pub async fn upload_to_agent_dir(
             })
         }
         Err(e) => {
-            let _ = tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.remove_file(&temp_path)).await;
+            if cleanup_on_error {
+                let _ = tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.remove_file(&temp_path)).await;
+            }
             emit_progress(
                 progress.as_ref(),
                 &remote_path,
@@ -521,6 +597,7 @@ pub async fn upload_folder_to_dir_with_sftp(
 ///
 /// Emits sftp://transfer/<id>/progress events if a transfer_id and app handle
 /// are provided. Set transfer_id=None for legacy/silent callers.
+#[allow(dead_code)]
 pub async fn upload_to_path_with_sftp(
     sftp: &SftpSession,
     local_path: &str,
@@ -528,6 +605,15 @@ pub async fn upload_to_path_with_sftp(
     progress: Option<(AppHandle, String)>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> AppResult<UploadResult> {
+    let prepared = prepare_upload_to_path_with_sftp(sftp, local_path, remote_path).await?;
+    upload_prepared_file(sftp, local_path, &prepared, false, progress, cancel, true).await
+}
+
+pub async fn prepare_upload_to_path_with_sftp(
+    sftp: &SftpSession,
+    local_path: &str,
+    remote_path: &str,
+) -> AppResult<PreparedUpload> {
     let meta = tokio::fs::metadata(local_path)
         .await
         .map_err(|e| AppError::Sftp(format!("stat local upload source: {e}")))?;
@@ -535,14 +621,6 @@ pub async fn upload_to_path_with_sftp(
         return Err(AppError::Invalid("local path is not a file".into()));
     }
     let total_size = meta.len();
-    // mkdir_p, the temp-file open, and the final rename are single-RPC
-    // calls — wrap each in the SFTP_OP_TIMEOUT so a wedged server can't
-    // hang the upload indefinitely at setup/teardown. The streaming write
-    // loop is intentionally NOT timeout-wrapped (long uploads are
-    // legitimate); the loop's cancel flag handles that case instead.
-    if total_size > MAX_UPLOAD_BYTES {
-        return Err(AppError::Invalid("file exceeds 1 GiB limit".into()));
-    }
     let remote_name = Path::new(remote_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -572,96 +650,23 @@ pub async fn upload_to_path_with_sftp(
         "{remote_path}.{}.tersh-upload",
         uuid::Uuid::new_v4().simple()
     );
-    let mut local_file = tokio::fs::File::open(local_path)
-        .await
-        .map_err(|e| AppError::Sftp(format!("open local: {e}")))?;
-    let open_fut = async {
-        sftp.open_with_flags(
-            &temp_path,
-            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-        )
-        .await
-        .map_err(|e| AppError::Sftp(format!("open remote {temp_path}: {e}")))
-    };
-    let mut remote_file = match with_timeout("sftp upload open_remote", open_fut).await {
-        Ok(f) => f,
-        Err(e) => return Err(e),
-    };
+    Ok(PreparedUpload {
+        remote_path,
+        remote_name,
+        temp_path,
+        total_size,
+    })
+}
 
-    let mut buf = vec![0u8; TRANSFER_BUF];
-    let mut total = 0u64;
-    let mut next_emit = PROGRESS_EVERY_BYTES;
-    let result: AppResult<()> = loop {
-        if let Some(ref c) = cancel {
-            if c.load(Ordering::Acquire) {
-                break Err(AppError::Sftp("upload cancelled".into()));
-            }
-        }
-        let n = match local_file.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => break Err(AppError::Sftp(format!("read local: {e}"))),
-        };
-        if n == 0 {
-            break Ok(());
-        }
-        if let Err(e) = remote_file.write_all(&buf[..n]).await {
-            break Err(AppError::Sftp(format!("write remote: {e}")));
-        }
-        total += n as u64;
-        if total >= next_emit {
-            emit_progress(progress.as_ref(), &remote_path, total, total_size, false);
-            next_emit = total + PROGRESS_EVERY_BYTES;
-        }
-    };
-    // Always try to close the handle. Errors here are advisory at this point.
-    let _ = remote_file.shutdown().await;
-    match result {
-        Ok(()) => {
-            // Atomic-publish: rename temp → final. Timeout protects against
-            // a wedged server stalling the final step after a full upload.
-            let rename_fut = async {
-                sftp.rename(&temp_path, &remote_path).await.map_err(|e| {
-                    AppError::Sftp(format!("rename {temp_path} -> {remote_path}: {e}"))
-                })
-            };
-            if let Err(e) = with_timeout("sftp upload rename", rename_fut).await {
-                let _ = tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.remove_file(&temp_path)).await;
-                emit_progress(
-                    progress.as_ref(),
-                    &remote_path,
-                    total,
-                    total_size.max(total),
-                    true,
-                );
-                return Err(e);
-            }
-            emit_progress(
-                progress.as_ref(),
-                &remote_path,
-                total,
-                total_size.max(total),
-                true,
-            );
-            Ok(UploadResult {
-                remote_path,
-                bytes_written: total,
-                agent_relative_name: None,
-            })
-        }
-        Err(e) => {
-            // Best-effort temp cleanup. Leaving it is also acceptable. Cap at
-            // SFTP_OP_TIMEOUT so we don't extend the failure with another wait.
-            let _ = tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.remove_file(&temp_path)).await;
-            emit_progress(
-                progress.as_ref(),
-                &remote_path,
-                total,
-                total_size.max(total),
-                true,
-            );
-            Err(e)
-        }
-    }
+pub async fn upload_to_path_prepared_with_sftp(
+    sftp: &SftpSession,
+    local_path: &str,
+    prepared: &PreparedUpload,
+    progress: Option<(AppHandle, String)>,
+    cancel: Option<Arc<AtomicBool>>,
+    cleanup_on_error: bool,
+) -> AppResult<UploadResult> {
+    upload_prepared_file(sftp, local_path, prepared, false, progress, cancel, cleanup_on_error).await
 }
 
 async fn collect_folder_upload_plan(local_dir: &str) -> AppResult<FolderUploadPlan> {
@@ -722,9 +727,6 @@ fn collect_folder_upload_plan_blocking(root: PathBuf) -> AppResult<FolderUploadP
             total_size = total_size
                 .checked_add(meta.len())
                 .ok_or_else(|| AppError::Invalid("folder upload is too large".into()))?;
-            if total_size > MAX_UPLOAD_BYTES {
-                return Err(AppError::Invalid("folder exceeds 1 GiB limit".into()));
-            }
             let relative = path.strip_prefix(&root).map_err(|e| {
                 AppError::Sftp(format!(
                     "derive relative upload path {}: {e}",

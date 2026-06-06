@@ -140,6 +140,9 @@ export const api = {
   revealInFinder: (path: string): Promise<void> =>
     invoke("reveal_in_finder", { path }),
 
+  openExternalUrl: (url: string): Promise<void> =>
+    invoke("open_external_url", { url }),
+
   /** [DIAG-INPUT] fire-and-forget; appends to ~/.tersh/diag.log so the
    *  developer can read the full input pipeline without opening devtools. */
   diagLog: (message: string): void => {
