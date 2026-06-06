@@ -43,6 +43,10 @@ impl SessionRegistry {
             .ok_or_else(|| AppError::SessionNotFound(id.to_string()))
     }
 
+    pub fn try_get(&self, id: &str) -> Option<Arc<SshSession>> {
+        self.inner.try_lock().ok()?.get(id).map(|e| e.session.clone())
+    }
+
     pub async fn host_id_for_session(&self, id: &str) -> AppResult<String> {
         self.inner
             .lock()

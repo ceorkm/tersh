@@ -667,6 +667,9 @@ async fn send_to_terminal_session(
     session_id: &str,
     bytes: Vec<u8>,
 ) -> AppResult<()> {
+    if let Some(session) = state.sessions.try_get(session_id) {
+        return session.send(bytes);
+    }
     if let Ok(session) = state.sessions.get(session_id).await {
         return session.send(bytes);
     }

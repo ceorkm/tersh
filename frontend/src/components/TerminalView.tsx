@@ -60,6 +60,7 @@ const BRACKETED_PASTE_START = "[200~";
 const BRACKETED_PASTE_END = "[201~";
 const TERMINAL_LINE_HEIGHT = 1.0;
 const ACTIVE_AGENT_ROW_REFRESH_INTERVAL_MS = 700;
+const ACTIVE_AGENT_FULL_HEAL_INTERVAL_MS = 1500;
 const AGENT_TRAILING_RENDER_HEAL_DELAY_MS = 700;
 
 /// Best-effort: read the user's current input from xterm's own buffer (the
@@ -155,10 +156,16 @@ export function TerminalView({
   const lastFit = useRef<{ cols: number; rows: number } | null>(null);
   const pendingFit = useRef<{ cols: number; rows: number } | null>(null);
   const lastRenderHealAt = useRef(0);
-  const lastActiveAgentRenderHealAt = useRef(0);
-  const activeAgentRenderHealRaf = useRef<number | null>(null);
+  const lastActiveAgentRowRefreshAt = useRef(0);
+  const lastActiveAgentFullHealAt = useRef(0);
+  const activeAgentRowRefreshRaf = useRef<number | null>(null);
+  const activeAgentFullHealRaf = useRef<number | null>(null);
+  // Keep this legacy binding for React Fast Refresh: an old effect cleanup can
+  // run after HMR with a closure that still references the pre-split RAF name.
+  const activeAgentRenderHealRaf = activeAgentFullHealRaf;
   const activeAgentTrailingHealTimer = useRef<number | null>(null);
   const agentSawAlternateBuffer = useRef(false);
+  const agentRenderDirty = useRef(false);
   const fitting = useRef(false);
   const unlisteners = useRef<Array<() => void>>([]);
   const dropUnlisten = useRef<(() => void) | null>(null);
@@ -172,6 +179,8 @@ export function TerminalView({
   const inputQueue = useRef<Uint8Array[]>([]);
   const inputQueuedBytes = useRef(0);
   const inputTimer = useRef<number | null>(null);
+  const inputTrackQueue = useRef("");
+  const inputTrackTimer = useRef<number | null>(null);
   const lastUserInputAt = useRef(0);
   const commandDraft = useRef("");
   const commandDraftUnsafe = useRef(false);
@@ -201,6 +210,7 @@ export function TerminalView({
   useEffect(() => {
     agentImagePasteCapable.current = false;
     agentSawAlternateBuffer.current = false;
+    agentRenderDirty.current = false;
     recentOutput.current = "";
   }, [tab.id, sessionId]);
   const activeRef = useRef(active);
@@ -225,9 +235,22 @@ export function TerminalView({
         window.clearTimeout(pendingChipDismissTimer.current);
         pendingChipDismissTimer.current = null;
       }
+      if (inputTrackTimer.current !== null) {
+        window.clearTimeout(inputTrackTimer.current);
+        inputTrackTimer.current = null;
+      }
+      inputTrackQueue.current = "";
       if (restoreTimer.current !== null) {
         window.clearTimeout(restoreTimer.current);
         restoreTimer.current = null;
+      }
+      if (activeAgentRowRefreshRaf.current !== null) {
+        cancelAnimationFrame(activeAgentRowRefreshRaf.current);
+        activeAgentRowRefreshRaf.current = null;
+      }
+      if (activeAgentFullHealRaf.current !== null) {
+        cancelAnimationFrame(activeAgentFullHealRaf.current);
+        activeAgentFullHealRaf.current = null;
       }
       if (activeAgentRenderHealRaf.current !== null) {
         cancelAnimationFrame(activeAgentRenderHealRaf.current);
@@ -274,27 +297,35 @@ export function TerminalView({
 
   const scheduleRendererHeal = (term: Terminal, minIntervalMs: number) => {
     const now = Date.now();
-    if (now - lastActiveAgentRenderHealAt.current < minIntervalMs) return;
-    if (activeAgentRenderHealRaf.current !== null) return;
-    lastActiveAgentRenderHealAt.current = now;
+    if (now - lastActiveAgentFullHealAt.current < minIntervalMs) return;
+    if (activeAgentFullHealRaf.current !== null) return;
+    lastActiveAgentFullHealAt.current = now;
 
-    activeAgentRenderHealRaf.current = requestAnimationFrame(() => {
-      activeAgentRenderHealRaf.current = null;
+    activeAgentFullHealRaf.current = requestAnimationFrame(() => {
       const currentTerm = termRef.current;
-      if (!currentTerm || !activeRef.current || currentTerm !== term) return;
+      if (!currentTerm || !activeRef.current || currentTerm !== term) {
+        activeAgentFullHealRaf.current = null;
+        return;
+      }
       forceRendererClear(currentTerm);
-      currentTerm.refresh(0, currentTerm.rows - 1);
+      activeAgentFullHealRaf.current = requestAnimationFrame(() => {
+        activeAgentFullHealRaf.current = null;
+        const repaintTerm = termRef.current;
+        if (!repaintTerm || !activeRef.current || repaintTerm !== term) return;
+        forceRendererRows(repaintTerm, 0, repaintTerm.rows - 1);
+        repaintTerm.refresh(0, repaintTerm.rows - 1);
+      });
     });
   };
 
   const scheduleAgentRowRefresh = (term: Terminal, minIntervalMs: number) => {
     const now = Date.now();
-    if (now - lastActiveAgentRenderHealAt.current < minIntervalMs) return;
-    if (activeAgentRenderHealRaf.current !== null) return;
-    lastActiveAgentRenderHealAt.current = now;
+    if (now - lastActiveAgentRowRefreshAt.current < minIntervalMs) return;
+    if (activeAgentRowRefreshRaf.current !== null) return;
+    lastActiveAgentRowRefreshAt.current = now;
 
-    activeAgentRenderHealRaf.current = requestAnimationFrame(() => {
-      activeAgentRenderHealRaf.current = null;
+    activeAgentRowRefreshRaf.current = requestAnimationFrame(() => {
+      activeAgentRowRefreshRaf.current = null;
       const currentTerm = termRef.current;
       if (!currentTerm || !activeRef.current || currentTerm !== term) return;
       if (!agentImagePasteCapable.current || currentTerm.buffer.active.type !== "alternate") return;
@@ -314,7 +345,7 @@ export function TerminalView({
       const currentTerm = termRef.current;
       if (!currentTerm || !activeRef.current || currentTerm !== term) return;
       if (!agentImagePasteCapable.current || currentTerm.buffer.active.type !== "alternate") return;
-      scheduleAgentRowRefresh(currentTerm, 0);
+      scheduleRendererHeal(currentTerm, ACTIVE_AGENT_FULL_HEAL_INTERVAL_MS);
     }, AGENT_TRAILING_RENDER_HEAL_DELAY_MS);
   };
 
@@ -322,8 +353,12 @@ export function TerminalView({
     const term = termRef.current;
     if (!term || !activeRef.current || !agentImagePasteCapable.current) return;
     if (term.buffer.active.type !== "alternate") {
-      if (agentSawAlternateBuffer.current && NORMAL_SHELL_OUTPUT_MARKER.test(recentOutput.current)) {
+      if (
+        (agentSawAlternateBuffer.current || agentRenderDirty.current) &&
+        NORMAL_SHELL_OUTPUT_MARKER.test(recentOutput.current)
+      ) {
         agentSawAlternateBuffer.current = false;
+        agentRenderDirty.current = false;
         scheduleRendererHeal(term, 0);
       }
       return;
@@ -639,6 +674,14 @@ export function TerminalView({
         window.clearTimeout(restoreTimer.current);
         restoreTimer.current = null;
       }
+      if (activeAgentRowRefreshRaf.current !== null) {
+        cancelAnimationFrame(activeAgentRowRefreshRaf.current);
+        activeAgentRowRefreshRaf.current = null;
+      }
+      if (activeAgentFullHealRaf.current !== null) {
+        cancelAnimationFrame(activeAgentFullHealRaf.current);
+        activeAgentFullHealRaf.current = null;
+      }
       if (activeAgentRenderHealRaf.current !== null) {
         cancelAnimationFrame(activeAgentRenderHealRaf.current);
         activeAgentRenderHealRaf.current = null;
@@ -686,7 +729,7 @@ export function TerminalView({
     // so decoding + regex-stripping a multi-megabyte burst in full is pure
     // waste that stalls rendering on high-churn output (agent TUIs, holding
     // an arrow key through long history). Cap the work to a fixed tail.
-    const TAIL = 8192;
+    const TAIL = 2048;
     const text = typeof chunk === "string"
       ? (chunk.length > TAIL ? chunk.slice(-TAIL) : chunk)
       : outputDecoder.current.decode(chunk.length > TAIL ? chunk.subarray(chunk.length - TAIL) : chunk);
@@ -694,6 +737,7 @@ export function TerminalView({
     const normalized = stripTerminalControls(text);
     if (AGENT_TUI_MARKER.test(normalized)) {
       agentImagePasteCapable.current = true;
+      agentRenderDirty.current = true;
     }
     recentOutput.current = (recentOutput.current + normalized).slice(-500);
     const tail = recentOutput.current.slice(-160);
@@ -737,19 +781,27 @@ export function TerminalView({
     api.sendInputRaw(sid, payload).catch(() => {});
   };
 
+  const shouldFlushInputImmediately = (data: string) => {
+    for (const ch of data) {
+      if (ch === "\u001b" || ch === "\u007f" || ch < " ") return true;
+    }
+    return false;
+  };
+
   const queueInput = (sid: string, data: string) => {
     lastUserInputAt.current = Date.now();
     const bytes = inputEncoder.current.encode(data);
     inputQueue.current.push(bytes);
     inputQueuedBytes.current += bytes.byteLength;
 
-    if (data.includes("\r") || data.includes("\n") || inputQueuedBytes.current >= 2048) {
+    if (shouldFlushInputImmediately(data) || inputQueuedBytes.current >= 2048) {
       flushInput(sid);
       return;
     }
     if (inputTimer.current === null) {
-      // Micro-batch tiny xterm writes (letters, arrows, delete) into one Tauri
-      // invoke. This keeps input responsive while avoiding per-key IPC churn.
+      // Micro-batch printable text into one Tauri invoke. Control keys
+      // (arrows, backspace, Enter, Ctrl) flush above because cursor movement
+      // should feel instant; printable bursts benefit from less IPC churn.
       inputTimer.current = window.setTimeout(() => flushInput(sid), 2);
     }
   };
@@ -779,11 +831,11 @@ export function TerminalView({
 
   const requestPromptEnhance = async () => {
     if (promptEnhancing) return;
-    // Prefer the tracked keystroke/paste draft (exact, no prompt-stripping);
-    // fall back to reading the live terminal line for anything the tracker
-    // missed (↑-recalled history, odd inputs).
-    let prompt = commandDraft.current.trim();
-    if (!prompt && termRef.current) {
+    // Local terminals keep a cheap command draft for history. SSH terminals
+    // avoid per-keystroke tracking on the hot path, so read their live line
+    // directly when the user invokes Enhance.
+    let prompt = isLocalTerminal ? commandDraft.current.trim() : "";
+    if (termRef.current && (!prompt || !isLocalTerminal)) {
       prompt = readCurrentTerminalInput(termRef.current).trim();
     }
     if (!prompt) {
@@ -916,6 +968,20 @@ export function TerminalView({
     }
   };
 
+  const flushTrackedInput = () => {
+    inputTrackTimer.current = null;
+    const data = inputTrackQueue.current;
+    inputTrackQueue.current = "";
+    if (data) trackInput(data);
+  };
+
+  const queueTrackedInput = (data: string) => {
+    inputTrackQueue.current += data;
+    if (inputTrackTimer.current === null) {
+      inputTrackTimer.current = window.setTimeout(flushTrackedInput, 50);
+    }
+  };
+
   const insertUploadedPath = (sid: string, text: string) => {
     const insertText = text.endsWith(" ") || text.endsWith("\n") || text.endsWith("\r")
       ? text
@@ -1015,11 +1081,12 @@ export function TerminalView({
       deviceAttributeInputBuffer.current = filtered.pending;
       if (!filtered.text) return;
       const data = filtered.text;
-      term.scrollToBottom();
-      term.focus();
-      trackInput(data);
       const sid = sessionIdRef.current;
       if (sid) queueInput(sid, data);
+      // SSH prompt enhancement reads the live terminal line on Ctrl+P, so do
+      // not spend extra work tracking every remote keystroke. Keep tracking for
+      // local terminals where it feeds local command history.
+      if (isLocalTerminal) queueTrackedInput(data);
     });
 
     let unmounted = false;
@@ -1028,8 +1095,10 @@ export function TerminalView({
         return;
       }
       const bytes = asBytes(message);
-      outputChunkRef.current?.(bytes);
       enqueueWrite(bytes);
+      queueMicrotask(() => {
+        if (!unmounted) outputChunkRef.current?.(bytes);
+      });
     });
     outputChannel.current = channel;
     api.bindTerminalOutput(sessionId, channel)
@@ -1043,14 +1112,18 @@ export function TerminalView({
       b64 => {
         if (unmounted) return;
         const bytes = base64ToBytes(b64);
-        outputChunkRef.current?.(bytes);
         enqueueWrite(bytes);
+        queueMicrotask(() => {
+          if (!unmounted) outputChunkRef.current?.(bytes);
+        });
       },
       b64 => {
         if (unmounted) return;
         const bytes = base64ToBytes(b64);
-        outputChunkRef.current?.(bytes);
         enqueueWrite(bytes);
+        queueMicrotask(() => {
+          if (!unmounted) outputChunkRef.current?.(bytes);
+        });
       },
       () => {
         if (unmounted) return;
@@ -1120,6 +1193,11 @@ export function TerminalView({
       if (inputTimer.current !== null) {
         window.clearTimeout(inputTimer.current);
         inputTimer.current = null;
+      }
+      if (inputTrackTimer.current !== null) {
+        window.clearTimeout(inputTrackTimer.current);
+        inputTrackTimer.current = null;
+        flushTrackedInput();
       }
       flushInput(sessionId);
       sub.dispose();

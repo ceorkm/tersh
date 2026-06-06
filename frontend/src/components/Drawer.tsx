@@ -462,6 +462,8 @@ function PromptEnhancerPanel({
 }) {
   const [settings, setSettingsState] = useState<PromptEnhancerSettings>(() => loadPromptEnhancerSettings());
   const [apiKey, setApiKeyState] = useState(() => loadPromptEnhancerApiKey());
+  const apiKeyPersistTimer = useRef<number | null>(null);
+  const latestApiKeyRef = useRef(apiKey);
   const configured = apiKey.trim().length > 0 && settings.model.trim().length > 0;
   // "Advanced" (model override + base URL) stays collapsed by default. The API
   // key is the only field most users touch, and it lives outside this toggle.
@@ -529,6 +531,11 @@ function PromptEnhancerPanel({
     panelMounted.current = true;
     return () => {
       panelMounted.current = false;
+      if (apiKeyPersistTimer.current !== null) {
+        window.clearTimeout(apiKeyPersistTimer.current);
+        apiKeyPersistTimer.current = null;
+        void api.promptEnhancerSetApiKey(latestApiKeyRef.current).catch(() => {});
+      }
       for (const off of unlistens.current) off();
       unlistens.current.clear();
     };
@@ -574,6 +581,7 @@ function PromptEnhancerPanel({
         if (cancelled || !stored) return;
         setApiKeyState(prev => {
           if (prev.trim()) return prev; // user already typed one this session
+          latestApiKeyRef.current = stored;
           savePromptEnhancerApiKey(stored);
           return stored;
         });
@@ -937,11 +945,25 @@ function PromptEnhancerPanel({
     setSettingsState(next);
     savePromptEnhancerSettings(next);
   };
+  const persistApiKeyNow = () => {
+    if (apiKeyPersistTimer.current !== null) {
+      window.clearTimeout(apiKeyPersistTimer.current);
+      apiKeyPersistTimer.current = null;
+    }
+    void api.promptEnhancerSetApiKey(latestApiKeyRef.current).catch(() => {
+      // sessionStorage still holds the value for this run; the next edit/blur
+      // retries vault persistence without blocking typing.
+    });
+  };
   const setApiKey = (next: string) => {
+    latestApiKeyRef.current = next;
     setApiKeyState(next);
     savePromptEnhancerApiKey(next); // fast in-session cache
-    // Persist encrypted at rest in the vault so it survives launches.
-    void api.promptEnhancerSetApiKey(next).catch(() => {/* cache still holds it this session */});
+    // Persist encrypted at rest in the vault, but never on every keystroke.
+    // Per-character vault IPC races can save an older partial key after a
+    // newer one, and they make the password field feel sticky in the DMG app.
+    if (apiKeyPersistTimer.current !== null) window.clearTimeout(apiKeyPersistTimer.current);
+    apiKeyPersistTimer.current = window.setTimeout(persistApiKeyNow, 450);
   };
 
   const changeProvider = (provider: PromptEnhancerProvider) => {
@@ -1005,6 +1027,7 @@ function PromptEnhancerPanel({
             placeholder={`Paste your ${providerLabel(settings.provider)} key`}
             value={apiKey}
             onChange={e => setApiKey(e.target.value)}
+            onBlur={persistApiKeyNow}
             spellCheck={false}
             autoComplete="off"
           />
