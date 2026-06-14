@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  ArrowRight, FolderClosed, User, KeyRound, Plus, Code2,
+  ArrowRight, FolderClosed, User, KeyRound, Code2,
   Network, Variable, ChevronDown, LockKeyhole,
+  Eye, EyeOff,
 } from "lucide-react";
 import { api } from "../lib/api";
 import { OsBadge, OS_LIST, OS_LABELS } from "../assets/os-icons";
@@ -26,8 +27,11 @@ export function HostInspector({ hosts, initialHost, onClose, onSaved, onSavedFal
   const [username, setUsername] = useState(initialHost?.username ?? "root");
   const [password, setPassword] = useState("");
   const passwordRef = useRef<HTMLInputElement>(null);
-  const [authKind, setAuthKind] = useState<"password" | "key_file">(initialHost?.auth_kind ?? "password");
+  const [showPassword, setShowPassword] = useState(false);
   const [keyPath, setKeyPath] = useState(initialHost?.key_path ?? "");
+  // The user picks the auth method from the dropdown; the matching input shows.
+  const [authMethod, setAuthMethod] = useState<"password" | "key_file">(initialHost?.auth_kind ?? "password");
+  const authKind = authMethod;
   const [groupName, setGroupName] = useState(initialHost?.group_name ?? "");
   const [jumpHostId, setJumpHostId] = useState(initialHost?.jump_host_id ?? "");
   const [envJson, setEnvJson] = useState(initialHost?.env_json ?? "");
@@ -73,6 +77,15 @@ export function HostInspector({ hosts, initialHost, onClose, onSaved, onSavedFal
   }, [initialHost]);
 
   const canConnect = hostname.trim() && username.trim() && (authKind === "password" || keyPath.trim());
+
+  const pickKey = async () => {
+    try {
+      const picked = await api.pickFile();
+      if (picked) setKeyPath(picked);
+    } catch (pickErr) {
+      if (mounted.current) setErr(`Could not open the file picker: ${String(pickErr)}`);
+    }
+  };
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -235,33 +248,45 @@ export function HostInspector({ hosts, initialHost, onClose, onSaved, onSavedFal
                 onChange={e => setUsername(e.target.value)}
               />
             </Row>
-            {authKind === "password" && (
-              <Row icon={<LockKeyhole size={14} />}>
+            <Row icon={<LockKeyhole size={14} />}>
+              <select
+                value={authMethod}
+                onChange={e => setAuthMethod(e.target.value as "password" | "key_file")}
+              >
+                <option value="password">Password</option>
+                <option value="key_file">Private key file</option>
+              </select>
+            </Row>
+            {authMethod === "password" && (
+              <Row
+                icon={<KeyRound size={14} />}
+                trailing={
+                  <button
+                    type="button"
+                    className="ghost icon-only"
+                    tabIndex={-1}
+                    onClick={() => setShowPassword(s => !s)}
+                    title={showPassword ? "Hide password" : "Show password"}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                  >
+                    {showPassword ? <Eye size={15} /> : <EyeOff size={15} />}
+                  </button>
+                }
+              >
                 <input
                   ref={passwordRef}
-                  type="text"
+                  type={showPassword ? "text" : "password"}
                   placeholder={initialHost && hasSavedPassword ? "Saved password (leave blank to keep)" : "Password"}
                   value={password}
                   onChange={e => setPassword(e.target.value)}
                 />
               </Row>
             )}
-            <button
-              type="button"
-              className="row-action subtle"
-              onClick={() => setAuthKind(a => a === "password" ? "key_file" : "password")}
-            >
-              <Plus size={14} strokeWidth={2} />
-              <span>{authKind === "password" ? "Use key file" : "Use password prompt"}</span>
-            </button>
-            {authKind === "key_file" && (
-              <Row icon={<KeyRound size={14} />}>
-                <input
-                  placeholder="/Users/you/.ssh/id_ed25519"
-                  value={keyPath}
-                  onChange={e => setKeyPath(e.target.value)}
-                />
-              </Row>
+            {authMethod === "key_file" && (
+              <button type="button" className="row-action" onClick={pickKey}>
+                <KeyRound size={14} strokeWidth={2} />
+                <span>{keyPath ? keyPath.split("/").pop() : "Choose key file…"}</span>
+              </button>
             )}
           </Card>
 
