@@ -338,7 +338,32 @@ async fn connect_transfer_sftp_for_session(
 ) -> AppResult<SftpOnlySession> {
     let host_id = state.sessions.host_id_for_session(session_id).await?;
     let (params, jump) = transfer_connect_params_for_host(state, &host_id).await?;
-    SshSession::connect_sftp_only(app, state.vault.clone(), params, jump).await
+    // The transfer runs over a second, dedicated SSH connection. Some servers
+    // briefly reset a parallel connection (sshd MaxStartups, fail2ban-style
+    // throttles), so a single reset shouldn't kill the whole upload. Retry a
+    // few times with backoff to ride out a throttle window before giving up.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64 + 300)).await;
+        }
+        match SshSession::connect_sftp_only(
+            app.clone(),
+            state.vault.clone(),
+            params.clone(),
+            jump.clone(),
+        )
+        .await
+        {
+            Ok(session) => return Ok(session),
+            Err(e) => {
+                tracing::warn!(attempt, "transfer sftp connect failed: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::Ssh("transfer connect: no attempts".into())))
 }
 
 fn upload_error_is_retryable(err: &AppError) -> bool {

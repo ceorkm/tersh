@@ -1271,6 +1271,11 @@ export function TerminalView({
             ? { ...t, done: true, failed: message }
             : t,
         ));
+        // Failures must auto-dismiss too. The success path schedules a dismiss
+        // but this one didn't, so a failed-upload toast (e.g. "transfer connect:
+        // Connection reset") stayed on screen forever. 4.5s gives time to read
+        // it, matching SftpPage's failure timing.
+        scheduleTransferDismiss(transferId, 4500);
       });
   };
 
