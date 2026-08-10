@@ -4287,6 +4287,7 @@ mod tests {
         extract_project_digest_from_response, normalize_host_input, parse_env_json,
         parse_prompt_enhancer_output, summarize_prompt_tool_call, validate_env_json,
         validate_export_file_path, validate_host_auth, validate_known_host_fingerprint,
+        validate_remote_mutation_path,
         validate_local_output_file_path, validate_private_key_import_path, validate_pty_size,
         validate_remote_chmod_mode, validate_remote_file_output_path,
         validate_remote_operation_path, validate_snippet_input, validate_startup_snippet,
@@ -4516,7 +4517,9 @@ mod tests {
         assert!(validate_remote_operation_path("/root/file.txt").is_ok());
         assert!(validate_remote_operation_path("").is_err());
         assert!(validate_remote_operation_path("relative/file.txt").is_err());
-        assert!(validate_remote_operation_path("~").is_err());
+        // Read-style ops may target home itself; mutations must not.
+        assert!(validate_remote_operation_path("~").is_ok());
+        assert!(validate_remote_mutation_path("~").is_err());
         assert!(validate_remote_operation_path("/").is_err());
         assert!(validate_remote_operation_path("/tmp/bad\0name").is_err());
     }

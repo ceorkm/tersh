@@ -10,9 +10,19 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-/// 256 KB chunk — about 4× the SFTP packet size, big enough to keep the wire
-/// saturated without buffering more than necessary in memory.
-const TRANSFER_BUF: usize = 256 * 1024;
+/// 255 KB chunk = 261120 bytes, exactly OpenSSH's max SFTP read/write payload
+/// (limits@openssh.com). 256 KB overshoots it by 1 KB, so russh-sftp split
+/// every chunk into a 255 KB request plus a degenerate 1 KB request — two
+/// round-trips, one of them nearly empty.
+const TRANSFER_BUF: usize = 255 * 1024;
+
+/// Concurrent SFTP write requests per upload. SFTP writes are strict
+/// request/response, so a single outstanding write caps throughput at
+/// chunk/RTT regardless of bandwidth (~2.5 MB/s at 50 ms ping). russh-sftp's
+/// public API allows one in-flight write per File handle, so we stripe chunks
+/// across this many handles to the same temp file at explicit offsets.
+/// 8 × 255 KB ≈ 2 MB in flight — matches russh's default channel window.
+const UPLOAD_WORKERS: usize = 8;
 
 /// Keep the transfer HUD responsive without flooding the frontend.
 const PROGRESS_EVERY_BYTES: u64 = 1024 * 1024;
@@ -30,6 +40,170 @@ where
     tokio::time::timeout(SFTP_OP_TIMEOUT, fut)
         .await
         .map_err(|_| AppError::Sftp(format!("{label} timed out after {SFTP_OP_TIMEOUT:?}")))?
+}
+
+/// Highest offset up to which every TRANSFER_BUF-sized chunk starting at
+/// `resume_from` has landed. Bytes past the first gap don't count — resume
+/// treats temp-file size as "contiguous bytes present", so overstating this
+/// would make a resumed upload skip a hole and publish a corrupt file.
+fn contiguous_watermark(resume_from: u64, completed: &std::collections::BTreeSet<u64>) -> u64 {
+    let mut watermark = resume_from;
+    for off in completed {
+        if *off == watermark {
+            watermark += TRANSFER_BUF as u64;
+        } else {
+            break;
+        }
+    }
+    watermark
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn watermark_stops_at_first_gap() {
+        let c: u64 = TRANSFER_BUF as u64;
+        let done: BTreeSet<u64> = [0, c, 3 * c].into_iter().collect(); // chunk 2 missing
+        assert_eq!(contiguous_watermark(0, &done), 2 * c);
+        // resume offsets are not chunk-aligned to zero
+        let done: BTreeSet<u64> = [100, 100 + c].into_iter().collect();
+        assert_eq!(contiguous_watermark(100, &done), 100 + 2 * c);
+        // nothing landed -> watermark stays at resume point
+        assert_eq!(contiguous_watermark(500, &BTreeSet::new()), 500);
+        // completed chunks below resume_from never advance it
+        let done: BTreeSet<u64> = [0].into_iter().collect();
+        assert_eq!(contiguous_watermark(c, &done), c);
+    }
+}
+
+/// Stream `local_path` into the already-created remote `temp_path` with
+/// UPLOAD_WORKERS pipelined writes. Returns bytes written by this call.
+///
+/// Writes land out of order, so on failure the temp file may contain holes
+/// past the contiguous prefix. Resume relies on temp-file size == contiguous
+/// bytes, so before returning an error we truncate the temp file down to the
+/// contiguous watermark (and remove it if that truncate fails).
+async fn pipelined_upload(
+    sftp: &SftpSession,
+    first_handle: russh_sftp::client::fs::File,
+    local_path: &str,
+    temp_path: &str,
+    resume_from: u64,
+    file_size: u64,
+    progress_path: &str,
+    progress_base: u64,
+    progress_total: u64,
+    progress: Option<&(AppHandle, String)>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> AppResult<u64> {
+    use std::collections::BTreeSet;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    if file_size <= resume_from {
+        return Ok(0);
+    }
+    // Worker 0 reuses the handle that created the staging file, so an upload
+    // that fits in one chunk performs exactly one open — identical to the
+    // pre-pipelining behaviour. Extra handles are only opened when the file
+    // actually spans multiple chunks.
+    let chunks = (file_size - resume_from).div_ceil(TRANSFER_BUF as u64);
+    let worker_count = UPLOAD_WORKERS.min(chunks.max(1) as usize);
+    let mut handles = vec![Some(first_handle)];
+    handles.resize_with(worker_count, || None);
+    let next_offset = Arc::new(std::sync::atomic::AtomicU64::new(resume_from));
+    let done_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let abort = Arc::new(AtomicBool::new(false));
+    // Completed chunk-start offsets, for the contiguous-prefix watermark.
+    let completed: Arc<AsyncMutex<BTreeSet<u64>>> = Arc::new(AsyncMutex::new(BTreeSet::new()));
+    let next_emit = Arc::new(AsyncMutex::new(
+        (progress_base + resume_from).saturating_add(PROGRESS_EVERY_BYTES),
+    ));
+
+    let workers = handles.into_iter().map(|preopened| {
+        let next_offset = next_offset.clone();
+        let done_bytes = done_bytes.clone();
+        let abort = abort.clone();
+        let completed = completed.clone();
+        let next_emit = next_emit.clone();
+        async move {
+            let mut local = tokio::fs::File::open(local_path)
+                .await
+                .map_err(|e| AppError::Sftp(format!("open local: {e}")))?;
+            // Worker 0 inherits the staging handle; siblings open their own.
+            // CREATE|WRITE, never TRUNCATE — the file exists and may already
+            // hold sibling writes.
+            let mut remote = match preopened {
+                Some(f) => f,
+                None => sftp
+                    .open_with_flags(temp_path, OpenFlags::CREATE | OpenFlags::WRITE)
+                    .await
+                    .map_err(|e| {
+                        AppError::Sftp(format!("pipelined worker reopen {temp_path}: {e}"))
+                    })?,
+            };
+            let mut buf = vec![0u8; TRANSFER_BUF];
+            let result: AppResult<()> = loop {
+                if abort.load(Ordering::Acquire)
+                    || cancel.is_some_and(|c| c.load(Ordering::Acquire))
+                {
+                    break Err(AppError::Sftp("upload cancelled".into()));
+                }
+                let off = next_offset.fetch_add(TRANSFER_BUF as u64, Ordering::AcqRel);
+                if off >= file_size {
+                    break Ok(());
+                }
+                let len = TRANSFER_BUF.min((file_size - off) as usize);
+                if let Err(e) = local.seek(SeekFrom::Start(off)).await {
+                    break Err(AppError::Sftp(format!("seek local: {e}")));
+                }
+                if let Err(e) = local.read_exact(&mut buf[..len]).await {
+                    break Err(AppError::Sftp(format!("read local: {e}")));
+                }
+                if let Err(e) = remote.seek(SeekFrom::Start(off)).await {
+                    break Err(AppError::Sftp(format!("seek remote: {e}")));
+                }
+                if let Err(e) = remote.write_all(&buf[..len]).await {
+                    break Err(AppError::Sftp(format!("write remote: {e}")));
+                }
+                completed.lock().await.insert(off);
+                let done = done_bytes.fetch_add(len as u64, Ordering::AcqRel) + len as u64;
+                let mut emit_at = next_emit.lock().await;
+                let progressed = progress_base + resume_from + done;
+                if progressed >= *emit_at {
+                    emit_progress(progress, progress_path, progressed, progress_total, false);
+                    *emit_at = progressed.saturating_add(PROGRESS_EVERY_BYTES);
+                }
+            };
+            if result.is_err() {
+                abort.store(true, Ordering::Release);
+            }
+            let _ = remote.shutdown().await;
+            result
+        }
+    });
+    let results = futures::future::join_all(workers).await;
+    let written = done_bytes.load(Ordering::Acquire);
+    if let Some(err) = results.into_iter().find_map(|r| r.err()) {
+        // Keep resume sound: shrink the temp file to the contiguous prefix.
+        let watermark = contiguous_watermark(resume_from, &*completed.lock().await);
+        let truncate = FileAttributes {
+            size: Some(watermark.min(file_size)),
+            ..Default::default()
+        };
+        if tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.set_metadata(temp_path, truncate))
+            .await
+            .map_err(|_| ())
+            .and_then(|r| r.map_err(|_| ()))
+            .is_err()
+        {
+            let _ = tokio::time::timeout(SFTP_OP_TIMEOUT, sftp.remove_file(temp_path)).await;
+        }
+        return Err(err);
+    }
+    Ok(written)
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -378,69 +552,46 @@ pub async fn upload_prepared_file(
         resume_from = 0;
     }
 
-    let mut local_file = tokio::fs::File::open(local_path)
-        .await
-        .map_err(|e| AppError::Sftp(format!("open local: {e}")))?;
-    if resume_from > 0 {
-        local_file
-            .seek(SeekFrom::Start(resume_from))
-            .await
-            .map_err(|e| AppError::Sftp(format!("seek local upload source: {e}")))?;
-    }
-
     let open_flags = if resume_from == 0 {
         OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
     } else {
         OpenFlags::CREATE | OpenFlags::WRITE
     };
     let open_fut = async {
-        sftp.open_with_flags(
-            &temp_path,
-            open_flags,
-        )
-        .await
-        .map_err(|e| AppError::Sftp(format!("open remote {temp_path}: {e}")))
+        sftp.open_with_flags(&temp_path, open_flags)
+            .await
+            .map_err(|e| AppError::Sftp(format!("create remote staging {temp_path}: {e}")))
     };
-    let mut remote_file = match with_timeout("sftp upload_session open_remote", open_fut).await {
+    let created = match with_timeout("sftp upload_session open_remote", open_fut).await {
         Ok(f) => f,
         Err(e) => return Err(e),
     };
-    if resume_from > 0 {
-        remote_file
-            .seek(SeekFrom::Start(resume_from))
-            .await
-            .map_err(|e| AppError::Sftp(format!("seek remote {temp_path}: {e}")))?;
-    }
 
-    let mut buf = vec![0u8; TRANSFER_BUF];
     let mut total = resume_from;
-    let mut next_emit = total.saturating_add(PROGRESS_EVERY_BYTES);
     if total > 0 {
         emit_progress(progress.as_ref(), &remote_path, total, total_size, false);
     }
-    let result: AppResult<()> = loop {
-        if let Some(ref c) = cancel {
-            if c.load(Ordering::Acquire) {
-                break Err(AppError::Sftp("upload cancelled".into()));
-            }
+    let result: AppResult<()> = match pipelined_upload(
+        sftp,
+        created,
+        local_path,
+        &temp_path,
+        resume_from,
+        total_size,
+        &remote_path,
+        0,
+        total_size,
+        progress.as_ref(),
+        cancel.as_ref(),
+    )
+    .await
+    {
+        Ok(written) => {
+            total += written;
+            Ok(())
         }
-        let n = match local_file.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => break Err(AppError::Sftp(format!("read local: {e}"))),
-        };
-        if n == 0 {
-            break Ok(());
-        }
-        if let Err(e) = remote_file.write_all(&buf[..n]).await {
-            break Err(AppError::Sftp(format!("write remote: {e}")));
-        }
-        total += n as u64;
-        if total >= next_emit {
-            emit_progress(progress.as_ref(), &remote_path, total, total_size, false);
-            next_emit = total + PROGRESS_EVERY_BYTES;
-        }
+        Err(e) => Err(e),
     };
-    let _ = remote_file.shutdown().await;
 
     // If we placed the file directly in the agent's CWD, the bare filename is
     // the most natural reference in the prompt. For neutral inbox uploads we
@@ -841,43 +992,40 @@ async fn upload_file_to_exact_path(
         "{remote_path}.{}.tersh-upload",
         uuid::Uuid::new_v4().simple()
     );
-    let mut local_file = tokio::fs::File::open(local_path)
-        .await
-        .map_err(|e| AppError::Sftp(format!("open local: {e}")))?;
-    let mut remote_file = with_timeout("sftp upload_folder open_remote", async {
+    let created = with_timeout("sftp upload_folder open_remote", async {
         sftp.open_with_flags(
             &temp_path,
             OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
         )
         .await
-        .map_err(|e| AppError::Sftp(format!("open remote {temp_path}: {e}")))
+        .map_err(|e| AppError::Sftp(format!("create remote staging {temp_path}: {e}")))
     })
     .await?;
-    let mut buf = vec![0u8; TRANSFER_BUF];
-    let mut next_emit = bytes_done.saturating_add(PROGRESS_EVERY_BYTES);
-    let result: AppResult<()> = loop {
-        if let Some(c) = cancel {
-            if c.load(Ordering::Acquire) {
-                break Err(AppError::Sftp("upload cancelled".into()));
-            }
+    let file_size = tokio::fs::metadata(local_path)
+        .await
+        .map_err(|e| AppError::Sftp(format!("stat local: {e}")))?
+        .len();
+    let result: AppResult<()> = match pipelined_upload(
+        sftp,
+        created,
+        local_path,
+        &temp_path,
+        0,
+        file_size,
+        progress_path,
+        *bytes_done,
+        total_size,
+        progress,
+        cancel,
+    )
+    .await
+    {
+        Ok(written) => {
+            *bytes_done += written;
+            Ok(())
         }
-        let n = match local_file.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => break Err(AppError::Sftp(format!("read local: {e}"))),
-        };
-        if n == 0 {
-            break Ok(());
-        }
-        if let Err(e) = remote_file.write_all(&buf[..n]).await {
-            break Err(AppError::Sftp(format!("write remote: {e}")));
-        }
-        *bytes_done += n as u64;
-        if *bytes_done >= next_emit {
-            emit_progress(progress, progress_path, *bytes_done, total_size, false);
-            next_emit = bytes_done.saturating_add(PROGRESS_EVERY_BYTES);
-        }
+        Err(e) => Err(e),
     };
-    let _ = remote_file.shutdown().await;
     match result {
         Ok(()) => {
             let rename_fut = async {

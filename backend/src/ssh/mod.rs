@@ -158,8 +158,16 @@ impl SshSession {
                 .await
                 .map_err(|e| AppError::Ssh(format!("connect via jump: {e}")))?
         } else {
-            let addr = (params.host.as_str(), params.port);
-            client::connect(config, addr, handler)
+            // TCP_NODELAY: russh does not disable Nagle, so every keystroke
+            // packet could sit in the kernel waiting to coalesce (interacts
+            // with delayed ACK for 40ms+ stalls). OpenSSH sets this on every
+            // interactive session; interactivity beats the negligible header
+            // overhead here too.
+            let stream = TcpStream::connect((params.host.as_str(), params.port))
+                .await
+                .map_err(|e| AppError::Ssh(format!("connect: {e}")))?;
+            let _ = stream.set_nodelay(true);
+            client::connect_stream(config, stream, handler)
                 .await
                 .map_err(|e| AppError::Ssh(format!("connect: {e}")))?
         };
@@ -518,7 +526,14 @@ impl SshSession {
                 .await
                 .map_err(|e| AppError::Ssh(format!("transfer connect via jump: {e}")))?
         } else {
-            client::connect(config, (params.host.as_str(), params.port), handler)
+            // Same TCP_NODELAY rationale as the interactive connect: without
+            // it, Nagle delays the small SFTP status replies that pace every
+            // pipelined write window.
+            let stream = TcpStream::connect((params.host.as_str(), params.port))
+                .await
+                .map_err(|e| AppError::Ssh(format!("transfer connect: {e}")))?;
+            let _ = stream.set_nodelay(true);
+            client::connect_stream(config, stream, handler)
                 .await
                 .map_err(|e| AppError::Ssh(format!("transfer connect: {e}")))?
         };
@@ -554,6 +569,12 @@ impl SshSession {
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| AppError::Sftp(format!("transfer sftp init: {e}")))?;
+        // russh-sftp aborts any request unanswered for 10s (its default).
+        // With ~2MB of pipelined writes queued on a normal uplink, the last
+        // write's ack legitimately takes longer than that, so the library
+        // was killing healthy large transfers. Our own SFTP_OP_TIMEOUT still
+        // bounds single-RPC ops at the command layer.
+        sftp.set_timeout(120).await;
         Ok(SftpOnlySession { handle, sftp })
     }
 
@@ -716,6 +737,9 @@ impl SshSession {
         let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| AppError::Sftp(format!("sftp init: {e}")))?;
+        // Same rationale as the transfer session: don't let the library's 10s
+        // per-request default abort large pipelined writes on slow uplinks.
+        sftp.set_timeout(120).await;
         Ok(sftp)
     }
 

@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Paperclip, X, AlertCircle, Check, WandSparkles, RefreshCw, Loader2 } from "lucide-react";
 import "@xterm/xterm/css/xterm.css";
 import { api, base64ToBytes, pathLooksSensitive } from "../lib/api";
@@ -585,6 +586,23 @@ export function TerminalView({
     term.loadAddon(unicodeGraphemes);
     term.loadAddon(fit);
     term.open(containerRef.current);
+    // GPU renderer: the DOM renderer leaves stale dirty rows during rapid
+    // agent TUI redraws (the whole renderer-heal machinery below exists for
+    // that). Load after open() as the addon needs the element. If WebGL is
+    // unavailable or the context is lost (GPU reset, backgrounded WKWebView),
+    // dispose and let xterm fall back to the DOM renderer silently.
+    let webgl: WebglAddon | null = null;
+    try {
+      webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        webgl?.dispose();
+        webgl = null;
+      });
+      term.loadAddon(webgl);
+    } catch {
+      webgl?.dispose();
+      webgl = null;
+    }
     // Keep xterm on the grapheme-aware Unicode 15 provider. The addon sets
     // this during activate(), but keep it explicit here so future refactors
     // don't accidentally drop back to plain wcwidth tables.
