@@ -614,12 +614,51 @@ export function TerminalView({
     // mouse-tracking DECSET/DECRST so xterm never activates mouse reporting.
     // ponytail: blanket block, no per-host opt-in. Costs tmux/vim click
     // support; add a host toggle if anyone misses it.
-    const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003]);
+    // Consuming the DECSET means xterm's alt-screen wheel fallback (arrow
+    // keys) kicks in — Claude Code then warns "Scroll wheel is sending arrow
+    // keys". So track what the app ASKED for and hand-encode wheel events to
+    // the pty ourselves: the app gets native wheel scrolling, xterm never
+    // activates mouse reporting, and drag-select keeps working.
+    const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003, 1005, 1006, 1015]);
+    const appMouseModes = new Set<number>();
+    let sgrMouse = false;
     for (const final of ["h", "l"]) {
-      term.parser.registerCsiHandler({ prefix: "?", final }, (params) =>
-        params.every((p) => typeof p === "number" && MOUSE_TRACKING_MODES.has(p)),
-      );
+      term.parser.registerCsiHandler({ prefix: "?", final }, (params) => {
+        if (!params.every((p) => typeof p === "number" && MOUSE_TRACKING_MODES.has(p))) {
+          return false;
+        }
+        for (const p of params as number[]) {
+          if (p === 1006) sgrMouse = final === "h";
+          else if (final === "h") appMouseModes.add(p);
+          else appMouseModes.delete(p);
+        }
+        return true;
+      });
     }
+    term.attachCustomWheelEventHandler((ev) => {
+      if (
+        appMouseModes.size === 0 ||
+        ev.deltaY === 0 ||
+        term.buffer.active.type !== "alternate"
+      ) {
+        return true;
+      }
+      const sid = sessionIdRef.current;
+      if (!sid) return true;
+      const rect = containerRef.current?.getBoundingClientRect();
+      const clampCell = (v: number, max: number) => Math.min(max, Math.max(1, Math.ceil(v)));
+      const col = rect ? clampCell(((ev.clientX - rect.left) / rect.width) * term.cols, term.cols) : 1;
+      const row = rect ? clampCell(((ev.clientY - rect.top) / rect.height) * term.rows, term.rows) : 1;
+      const btn = ev.deltaY < 0 ? 64 : 65;
+      // deltaMode 1 = lines (real wheels, |delta|~3), 0 = pixels (trackpads).
+      const magnitude = ev.deltaMode === 1 ? Math.abs(ev.deltaY) / 3 : Math.abs(ev.deltaY) / 40;
+      const steps = Math.min(5, Math.max(1, Math.round(magnitude)));
+      const seq = sgrMouse
+        ? `\x1b[<${btn};${col};${row}M`
+        : `\x1b[M${String.fromCharCode(32 + btn)}${String.fromCharCode(32 + Math.min(col, 222))}${String.fromCharCode(32 + Math.min(row, 222))}`;
+      queueInput(sid, seq.repeat(steps));
+      return false;
+    });
     // OSC 52 is hostile by default. A host must be explicitly trusted, the
     // terminal must be foregrounded, and only bounded clipboard WRITES to the
     // standard `c` target are accepted. Reads (`c;?`) are always dropped.
