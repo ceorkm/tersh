@@ -156,6 +156,7 @@ impl Vault {
               key_path    TEXT,                 -- for auth_kind='key_file'
               group_name  TEXT,
               os          TEXT,
+              allow_remote_clipboard INTEGER NOT NULL DEFAULT 0,
               created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
               updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
@@ -239,13 +240,16 @@ impl Vault {
             .execute("ALTER TABLE hosts ADD COLUMN startup_snippet TEXT", []);
         let _ = self
             .conn
+            .execute("ALTER TABLE hosts ADD COLUMN allow_remote_clipboard INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self
+            .conn
             .execute("ALTER TABLE snippets ADD COLUMN group_path TEXT", []);
         Ok(())
     }
 
     pub fn list_hosts(&self) -> AppResult<Vec<HostRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, hostname, port, username, auth_kind, key_path, group_name, os, jump_host_id, env_json, startup_snippet FROM hosts ORDER BY group_name, label",
+            "SELECT id, label, hostname, port, username, auth_kind, key_path, group_name, os, jump_host_id, env_json, startup_snippet, allow_remote_clipboard FROM hosts ORDER BY group_name, label",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -262,6 +266,7 @@ impl Vault {
                     jump_host_id: row.get(9).ok(),
                     env_json: row.get(10).ok(),
                     startup_snippet: row.get(11).ok(),
+                    allow_remote_clipboard: row.get(12).unwrap_or(false),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -271,8 +276,8 @@ impl Vault {
     pub fn add_host(&self, input: AddHostInput) -> AppResult<String> {
         let id = uuid::Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO hosts (id, label, hostname, port, username, auth_kind, key_path, group_name, os, jump_host_id, env_json, startup_snippet)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO hosts (id, label, hostname, port, username, auth_kind, key_path, group_name, os, jump_host_id, env_json, startup_snippet, allow_remote_clipboard)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 input.label,
@@ -286,6 +291,7 @@ impl Vault {
                 input.jump_host_id,
                 input.env_json,
                 input.startup_snippet,
+                input.allow_remote_clipboard,
             ],
         )?;
         self.checkpoint()?;
@@ -294,7 +300,7 @@ impl Vault {
 
     pub fn update_host(&self, id: &str, input: AddHostInput) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE hosts SET label=?1, hostname=?2, port=?3, username=?4, auth_kind=?5, key_path=?6, group_name=?7, os=?8, jump_host_id=?9, env_json=?10, startup_snippet=?11, updated_at=strftime('%s','now') WHERE id=?12",
+            "UPDATE hosts SET label=?1, hostname=?2, port=?3, username=?4, auth_kind=?5, key_path=?6, group_name=?7, os=?8, jump_host_id=?9, env_json=?10, startup_snippet=?11, allow_remote_clipboard=?12, updated_at=strftime('%s','now') WHERE id=?13",
             params![
                 input.label,
                 input.hostname,
@@ -307,6 +313,7 @@ impl Vault {
                 input.jump_host_id,
                 input.env_json,
                 input.startup_snippet,
+                input.allow_remote_clipboard,
                 id,
             ],
         )?;
@@ -737,11 +744,11 @@ impl Vault {
                     let h: HostRow = serde_json::from_value(row.clone())
                         .map_err(|e| AppError::Vault(format!("hosts row: {e}")))?;
                     self.conn.execute(
-                        "INSERT INTO hosts (id, label, hostname, port, username, auth_kind, key_path, group_name, os, jump_host_id, env_json, startup_snippet)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        "INSERT INTO hosts (id, label, hostname, port, username, auth_kind, key_path, group_name, os, jump_host_id, env_json, startup_snippet, allow_remote_clipboard)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         params![
                             h.id, h.label, h.hostname, h.port, h.username, h.auth_kind,
-                            h.key_path, h.group_name, h.os, h.jump_host_id, h.env_json, h.startup_snippet,
+                            h.key_path, h.group_name, h.os, h.jump_host_id, h.env_json, h.startup_snippet, h.allow_remote_clipboard,
                         ],
                     )?;
                 }
@@ -936,13 +943,16 @@ mod tests {
             jump_host_id: None,
             env_json: None,
             startup_snippet: None,
+            allow_remote_clipboard: false,
         }
     }
 
     #[test]
     fn vault_export_restore_preserves_host_secrets() {
         let source = test_vault("source");
-        let host_id = source.add_host(host_input("prod")).unwrap();
+        let mut input = host_input("prod");
+        input.allow_remote_clipboard = true;
+        let host_id = source.add_host(input).unwrap();
         source
             .set_host_password(&host_id, "secret-password")
             .unwrap();
@@ -959,6 +969,11 @@ mod tests {
             target.get_host_password(&host_id).unwrap().as_deref(),
             Some("secret-password")
         );
+        assert!(target
+            .list_hosts()
+            .unwrap()
+            .iter()
+            .any(|host| host.id == host_id && host.allow_remote_clipboard));
     }
 
     #[test]
@@ -1069,6 +1084,8 @@ pub struct HostRow {
     pub jump_host_id: Option<String>,
     pub env_json: Option<String>,
     pub startup_snippet: Option<String>,
+    #[serde(default)]
+    pub allow_remote_clipboard: bool,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -1087,6 +1104,8 @@ pub struct AddHostInput {
     pub env_json: Option<String>,
     #[serde(default)]
     pub startup_snippet: Option<String>,
+    #[serde(default)]
+    pub allow_remote_clipboard: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]

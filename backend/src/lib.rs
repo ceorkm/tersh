@@ -82,6 +82,7 @@ pub fn run() {
             commands::send_input,
             commands::send_input_raw,
             commands::copy_local_image_to_clipboard,
+            commands::copy_text_to_clipboard,
             commands::resize_pty,
             commands::sftp_upload_local,
             commands::sftp_upload_folder_local,

@@ -3997,6 +3997,10 @@ code.drow-sub { background: transparent; padding: 0; }
 .ih-toggle-row:hover { background: var(--bg-hover); }
 .ih-toggle-row .row-meta { margin-left: auto; }
 .ih-toggle-row .hide-x { display: none; }
+.ih-toggle-copy { cursor: default; }
+.ih-toggle-copy-copy { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.ih-toggle-copy-copy > span { color: var(--text); font-size: 13px; }
+.ih-toggle-copy-copy > small { color: var(--text-dim); font-size: 11px; line-height: 1.35; }
 
 .ih-err {
   background: color-mix(in srgb, var(--danger) 15%, transparent);

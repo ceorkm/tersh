@@ -37,6 +37,8 @@ export const api = {
 
   copyLocalImageToClipboard: (path: string): Promise<void> =>
     invoke("copy_local_image_to_clipboard", { path }),
+  copyTextToClipboard: (text: string): Promise<void> =>
+    invoke("copy_text_to_clipboard", { text }),
 
   resize: (sessionId: string, cols: number, rows: number): Promise<void> =>
     invoke("resize_pty", { sessionId, cols, rows }),

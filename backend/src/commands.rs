@@ -15,6 +15,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 const LARGE_TRANSFER_ATTEMPTS: usize = 12;
+const MAX_REMOTE_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
 
 #[tauri::command]
 pub async fn list_hosts(state: State<'_, AppState>) -> AppResult<Vec<HostRow>> {
@@ -642,6 +643,70 @@ pub async fn send_input_raw(state: State<'_, AppState>, request: Request<'_>) ->
 #[tauri::command]
 pub async fn copy_local_image_to_clipboard(path: String) -> AppResult<()> {
     copy_local_image_to_clipboard_impl(&path).await
+}
+
+/// Clipboard writes requested by a trusted remote terminal via OSC 52.
+/// The frontend only invokes this after its host-level opt-in, focused-tab,
+/// payload-format, and rate-limit checks. This command is deliberately write-only.
+#[tauri::command]
+pub async fn copy_text_to_clipboard(text: String) -> AppResult<()> {
+    validate_remote_clipboard_text(&text)?;
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+
+            // pbcopy writes directly to the pasteboard and accepts the content
+            // on stdin, avoiding an AppleScript argument and its focus/runtime
+            // quirks. The frontend has already limited this to trusted OSC 52.
+            let mut child = Command::new("/usr/bin/pbcopy")
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|e| AppError::Ssh(format!("clipboard command failed: {e}")))?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| AppError::Ssh("clipboard stdin unavailable".into()))?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| AppError::Ssh(format!("clipboard write failed: {e}")))?;
+            drop(stdin);
+            let status = child
+                .wait()
+                .map_err(|e| AppError::Ssh(format!("clipboard command failed: {e}")))?;
+            if !status.success() {
+                return Err(AppError::Ssh("copy text to clipboard failed".into()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AppError::Ssh(format!("clipboard task failed: {e}")))??;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        Err(AppError::Invalid(
+            "remote clipboard writes are not supported on this platform yet".into(),
+        ))
+    }
+}
+
+fn validate_remote_clipboard_text(text: &str) -> AppResult<()> {
+    if text.is_empty() {
+        return Err(AppError::Invalid("clipboard text must not be empty".into()));
+    }
+    if text.len() > MAX_REMOTE_CLIPBOARD_TEXT_BYTES {
+        return Err(AppError::Invalid(format!(
+            "clipboard text is too large ({} bytes, max {} bytes)",
+            text.len(), MAX_REMOTE_CLIPBOARD_TEXT_BYTES
+        )));
+    }
+    if text.contains('\0') {
+        return Err(AppError::Invalid("clipboard text contains NUL".into()));
+    }
+    Ok(())
 }
 
 async fn copy_local_image_to_clipboard_impl(path: &str) -> AppResult<()> {
@@ -4225,7 +4290,8 @@ mod tests {
         validate_local_output_file_path, validate_private_key_import_path, validate_pty_size,
         validate_remote_chmod_mode, validate_remote_file_output_path,
         validate_remote_operation_path, validate_snippet_input, validate_startup_snippet,
-        validate_terminal_input_len, validate_tunnel_input, MAX_CLIPBOARD_IMAGE_BYTES,
+        validate_remote_clipboard_text, validate_terminal_input_len, validate_tunnel_input,
+        MAX_CLIPBOARD_IMAGE_BYTES, MAX_REMOTE_CLIPBOARD_TEXT_BYTES,
     };
     use crate::vault::{AddHostInput, AddSnippetInput, AddTunnelInput};
 
@@ -4242,6 +4308,7 @@ mod tests {
             jump_host_id: None,
             env_json: None,
             startup_snippet: None,
+            allow_remote_clipboard: false,
         }
     }
 
@@ -4272,6 +4339,14 @@ mod tests {
         assert_eq!(input.hostname, "192.0.2.10");
         assert_eq!(input.username, "root");
         assert_eq!(input.label, "192.0.2.10");
+    }
+
+    #[test]
+    fn remote_clipboard_text_is_bounded_and_nul_free() {
+        assert!(validate_remote_clipboard_text("copied text").is_ok());
+        assert!(validate_remote_clipboard_text("").is_err());
+        assert!(validate_remote_clipboard_text("a\0b").is_err());
+        assert!(validate_remote_clipboard_text(&"a".repeat(MAX_REMOTE_CLIPBOARD_TEXT_BYTES + 1)).is_err());
     }
 
     #[test]

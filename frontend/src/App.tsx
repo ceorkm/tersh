@@ -54,6 +54,7 @@ const LOCAL_TERMINAL_HOST: HostRow = {
   key_path: null,
   group_name: null,
   os: "apple",
+  allow_remote_clipboard: false,
 };
 
 function normalizeFallbackHost(value: unknown): HostRow | null {
@@ -81,6 +82,7 @@ function normalizeFallbackHost(value: unknown): HostRow | null {
     jump_host_id: typeof row.jump_host_id === "string" && row.jump_host_id.trim() ? row.jump_host_id : null,
     env_json: typeof row.env_json === "string" && row.env_json.trim() ? row.env_json : null,
     startup_snippet: typeof row.startup_snippet === "string" && row.startup_snippet.trim() ? row.startup_snippet : null,
+    allow_remote_clipboard: row.allow_remote_clipboard === true,
   };
 }
 
@@ -1063,6 +1065,7 @@ export function App() {
     jump_host_id: host.jump_host_id ?? null,
     env_json: host.env_json ?? null,
     startup_snippet: host.startup_snippet ?? null,
+    allow_remote_clipboard: host.allow_remote_clipboard === true,
   });
 
   const deleteHost = async (id: string) => {
@@ -1501,6 +1504,11 @@ export function App() {
             setAddDialogOpen(false);
             setEditingHost(null);
             await refreshHosts();
+            if (host && editingHost) {
+              commitTabs(prev => prev.map(tab =>
+                tab.host.id === host.id ? { ...tab, host } : tab
+              ));
+            }
             if (host && !editingHost) connectHost(host, password ?? null, !!password);
           }}
           onSavedFallback={(host) => {
@@ -1509,6 +1517,11 @@ export function App() {
               : [...hosts, host];
             saveFallbackHosts(next);
             setHosts(next);
+            if (editingHost) {
+              commitTabs(prev => prev.map(tab =>
+                tab.host.id === host.id ? { ...tab, host } : tab
+              ));
+            }
             setAddDialogOpen(false);
             setEditingHost(null);
           }}

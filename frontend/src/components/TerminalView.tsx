@@ -62,6 +62,26 @@ const TERMINAL_LINE_HEIGHT = 1.0;
 const ACTIVE_AGENT_ROW_REFRESH_INTERVAL_MS = 700;
 const ACTIVE_AGENT_FULL_HEAL_INTERVAL_MS = 1500;
 const AGENT_TRAILING_RENDER_HEAL_DELAY_MS = 700;
+const MAX_OSC52_CLIPBOARD_BYTES = 256 * 1024;
+const OSC52_WRITE_WINDOW_MS = 10_000;
+const MAX_OSC52_WRITES_PER_WINDOW = 4;
+
+function decodeOsc52ClipboardWrite(data: string): string | null {
+  const separator = data.indexOf(";");
+  if (separator < 1 || data.slice(0, separator) !== "c") return null;
+  const encoded = data.slice(separator + 1);
+  // OSC 52 uses `?` to request a clipboard read. Tersh never permits those.
+  if (!encoded || encoded === "?" || encoded.length > Math.ceil(MAX_OSC52_CLIPBOARD_BYTES * 4 / 3) + 4) return null;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) return null;
+  try {
+    const raw = atob(encoded);
+    if (raw.length === 0 || raw.length > MAX_OSC52_CLIPBOARD_BYTES) return null;
+    const bytes = Uint8Array.from(raw, char => char.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
 
 /// Best-effort: read the user's current input from xterm's own buffer (the
 /// logical line at the cursor, with the shell prompt stripped). Used as a
@@ -191,6 +211,14 @@ export function TerminalView({
   const agentImagePasteCapable = useRef(false);
   const suppressSensitiveInput = useRef(false);
   const lastInsertedUpload = useRef<{ text: string; at: number } | null>(null);
+  const allowRemoteClipboardRef = useRef(tab.host.allow_remote_clipboard === true);
+  // WKWebView's document.hasFocus() can be false while the native Tauri window
+  // is visibly active. Track the host-window focus signal instead so a trusted
+  // OSC 52 write is neither dropped nor accepted while Tersh is backgrounded.
+  const windowFocusedRef = useRef(!document.hidden);
+  const remoteClipboardWrites = useRef({ startedAt: 0, count: 0 });
+  const pendingRemoteClipboardWrite = useRef<string | null>(null);
+  const remoteClipboardWriteInFlight = useRef(false);
   const pendingChipDismissTimer = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   // Per-tab transfer dock: each in-flight upload renders as a card stacked
@@ -219,6 +247,31 @@ export function TerminalView({
   useEffect(() => {
     activeRef.current = active;
   }, [active]);
+
+  useEffect(() => {
+    allowRemoteClipboardRef.current = tab.host.allow_remote_clipboard === true;
+  }, [tab.host.allow_remote_clipboard]);
+
+  const writeRemoteClipboard = (text: string) => {
+    if (remoteClipboardWriteInFlight.current) {
+      pendingRemoteClipboardWrite.current = text;
+      return;
+    }
+    remoteClipboardWriteInFlight.current = true;
+    void api.copyTextToClipboard(text).then(() => {
+      remoteClipboardWriteInFlight.current = false;
+      const pending = pendingRemoteClipboardWrite.current;
+      pendingRemoteClipboardWrite.current = null;
+      if (pending && pending !== text && allowRemoteClipboardRef.current && activeRef.current && windowFocusedRef.current) {
+        writeRemoteClipboard(pending);
+      }
+    }).catch(() => {
+      remoteClipboardWriteInFlight.current = false;
+      // Clipboard services can reject a write during a focus transition. Keep
+      // only the latest trusted write and retry once when the app regains focus.
+      pendingRemoteClipboardWrite.current = text;
+    });
+  };
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -509,7 +562,10 @@ export function TerminalView({
       convertEol: false,
       windowsMode: false,
       macOptionIsMeta: false,
-      macOptionClickForcesSelection: false,
+      // Fallback only: mouse-tracking DECSET is consumed below, but if an app
+      // sneaks mouse capture on via a mixed-param sequence, Option+drag still
+      // forces a local selection.
+      macOptionClickForcesSelection: true,
       rightClickSelectsWord: false,
       fastScrollModifier: "alt",
       fastScrollSensitivity: 5,
@@ -533,11 +589,37 @@ export function TerminalView({
     // this during activate(), but keep it explicit here so future refactors
     // don't accidentally drop back to plain wcwidth tables.
     term.unicode.activeVersion = "15-graphemes";
-    // Block OSC 52 from remote: a compromised server could otherwise rewrite
-    // the local clipboard via terminal output. Returning true tells xterm.js
-    // the sequence was handled; we drop it. MUST be after open() — the parser
-    // is wired during open and earlier registration silently misses the handler.
-    term.parser.registerOscHandler(52, () => true);
+    // Apps never get to capture the mouse. Claude Code 2.1+ (and other TUIs)
+    // enable mouse tracking (CSI ?1000h etc.), which makes xterm forward drags
+    // to the app and kills local drag-selection, so plain select-and-Cmd+C
+    // stops working. Selection and copy always win in Tersh: consume every
+    // mouse-tracking DECSET/DECRST so xterm never activates mouse reporting.
+    // ponytail: blanket block, no per-host opt-in. Costs tmux/vim click
+    // support; add a host toggle if anyone misses it.
+    const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003]);
+    for (const final of ["h", "l"]) {
+      term.parser.registerCsiHandler({ prefix: "?", final }, (params) =>
+        params.every((p) => typeof p === "number" && MOUSE_TRACKING_MODES.has(p)),
+      );
+    }
+    // OSC 52 is hostile by default. A host must be explicitly trusted, the
+    // terminal must be foregrounded, and only bounded clipboard WRITES to the
+    // standard `c` target are accepted. Reads (`c;?`) are always dropped.
+    term.parser.registerOscHandler(52, (data: string) => {
+      if (!allowRemoteClipboardRef.current || !activeRef.current || !windowFocusedRef.current) return true;
+      const text = decodeOsc52ClipboardWrite(data);
+      if (!text) return true;
+      const now = Date.now();
+      const windowState = remoteClipboardWrites.current;
+      if (now - windowState.startedAt >= OSC52_WRITE_WINDOW_MS) {
+        windowState.startedAt = now;
+        windowState.count = 0;
+      }
+      if (windowState.count >= MAX_OSC52_WRITES_PER_WINDOW) return true;
+      windowState.count += 1;
+      writeRemoteClipboard(text);
+      return true;
+    });
     // OSC 7: shells report their working directory as `file://host/path`.
     // Capture it (best-effort — only emitted if the shell is configured to) so
     // Browse and the upload suggestion can anchor to the live cwd. We consume
@@ -646,16 +728,27 @@ export function TerminalView({
         else windowUnlisteners.push(unlisten);
       }).catch(() => {});
     };
-    const onWindowFocus = () => recoverAfterWindowGeometryChange();
+    const onWindowFocus = () => {
+      windowFocusedRef.current = true;
+      const pending = pendingRemoteClipboardWrite.current;
+      pendingRemoteClipboardWrite.current = null;
+      if (pending && allowRemoteClipboardRef.current && activeRef.current) writeRemoteClipboard(pending);
+      recoverAfterWindowGeometryChange();
+    };
+    const onWindowBlur = () => {
+      windowFocusedRef.current = false;
+    };
     const onVisibilityChange = () => {
       if (!document.hidden) recoverAfterWindowGeometryChange();
     };
     window.addEventListener("focus", onWindowFocus);
+    window.addEventListener("blur", onWindowBlur);
     document.addEventListener("visibilitychange", onVisibilityChange);
     trackWindowUnlisten(windowTarget.onResized(() => recoverAfterWindowGeometryChange()));
     trackWindowUnlisten(windowTarget.onScaleChanged(() => recoverAfterWindowGeometryChange()));
     trackWindowUnlisten(windowTarget.onFocusChanged(({ payload }) => {
-      if (payload) recoverAfterWindowGeometryChange();
+      windowFocusedRef.current = payload;
+      if (payload) onWindowFocus();
     }));
 
     return () => {
@@ -664,6 +757,7 @@ export function TerminalView({
       cancelledWindowListeners = true;
       for (const unlisten of windowUnlisteners) unlisten();
       window.removeEventListener("focus", onWindowFocus);
+      window.removeEventListener("blur", onWindowBlur);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       ro.disconnect();
       if (resizeTimer.current !== null) {

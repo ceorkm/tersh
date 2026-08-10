@@ -15,6 +15,8 @@ export interface HostRow {
   jump_host_id?: string | null;
   env_json?: string | null;
   startup_snippet?: string | null;
+  /** Explicit trust decision: remote OSC 52 may write, never read, the local clipboard. */
+  allow_remote_clipboard?: boolean;
 }
 
 export interface AddHostInput {
@@ -29,6 +31,7 @@ export interface AddHostInput {
   jump_host_id?: string | null;
   env_json?: string | null;
   startup_snippet?: string | null;
+  allow_remote_clipboard?: boolean;
 }
 
 export type AgentKind = "claude" | "aider" | "codex" | "gemini" | "cursor_agent";

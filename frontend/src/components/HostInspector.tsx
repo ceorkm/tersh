@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ArrowRight, FolderClosed, User, KeyRound, Code2,
   Network, Variable, ChevronDown, LockKeyhole,
-  Eye, EyeOff,
+  Eye, EyeOff, Clipboard,
 } from "lucide-react";
 import { api } from "../lib/api";
 import { OsBadge, OS_LIST, OS_LABELS } from "../assets/os-icons";
@@ -36,6 +36,7 @@ export function HostInspector({ hosts, initialHost, onClose, onSaved, onSavedFal
   const [jumpHostId, setJumpHostId] = useState(initialHost?.jump_host_id ?? "");
   const [envJson, setEnvJson] = useState(initialHost?.env_json ?? "");
   const [startupSnippet, setStartupSnippet] = useState(initialHost?.startup_snippet ?? "");
+  const [allowRemoteClipboard, setAllowRemoteClipboard] = useState(initialHost?.allow_remote_clipboard === true);
   const [os, setOs] = useState<OsKind>(initialHost?.os ?? "linux");
   const [osPickerOpen, setOsPickerOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -120,6 +121,7 @@ export function HostInspector({ hosts, initialHost, onClose, onSaved, onSavedFal
       jump_host_id: jumpHostId || null,
       env_json: env || null,
       startup_snippet: startupSnippet.trim() || null,
+      allow_remote_clipboard: allowRemoteClipboard,
     };
     try {
       const passwordValue = passwordRef.current?.value || password;
@@ -315,6 +317,26 @@ export function HostInspector({ hosts, initialHost, onClose, onSaved, onSavedFal
                 rows={3}
               />
             </Row>
+            <div className="ih-toggle-row ih-toggle-copy">
+              <Clipboard className="ih-row-icon" size={14} />
+              <div className="ih-toggle-copy-copy">
+                <span>Remote clipboard</span>
+                <small>Allow apps on this host to copy text to your Mac.</small>
+              </div>
+              <button
+                type="button"
+                className={"prompt-index-switch" + (allowRemoteClipboard ? " on" : "")}
+                onClick={() => setAllowRemoteClipboard(value => !value)}
+                role="switch"
+                aria-checked={allowRemoteClipboard}
+                title={allowRemoteClipboard ? "Block remote clipboard writes" : "Allow remote clipboard writes"}
+              >
+                <span className="prompt-index-switch-track" aria-hidden>
+                  <span className="prompt-index-switch-thumb" />
+                </span>
+                <span>{allowRemoteClipboard ? "On" : "Off"}</span>
+              </button>
+            </div>
           </Card>
 
           {err && <div className="ih-err">{err}</div>}

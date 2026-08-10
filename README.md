@@ -127,7 +127,7 @@ Flip into **Collaborator Mode** and the terminal becomes a **shared workbench**:
 - **Agent detection**: Claude Code · Codex · aider · Gemini · cursor-agent
 
 **🛡️ Security & ⌨️ UX**
-- Host-key **TOFU** · **OSC 52 blocked** · drag-drop **never auto-sends**
+- Host-key **TOFU** · **OSC 52 blocked by default** (per-host opt-in for trusted agent copy) · drag-drop **never auto-sends**
 - Sensitive-path defense-in-depth (frontend **and** backend)
 - **Cmd+K** command palette (fuzzy hosts, snippets, settings)
 - **14 themes · 7 fonts** · adjustable text size
