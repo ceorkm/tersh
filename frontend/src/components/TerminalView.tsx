@@ -241,8 +241,12 @@ export function TerminalView({
     agentSawAlternateBuffer.current = false;
     agentRenderDirty.current = false;
     recentOutput.current = "";
+    clearSyntheticMouseRef.current?.();
   }, [tab.id, sessionId]);
   const activeRef = useRef(active);
+  // Set by the mount effect; lets the session-change effect above drop any
+  // remembered app mouse modes so a new shell never inherits them.
+  const clearSyntheticMouseRef = useRef<(() => void) | null>(null);
   const isLocalTerminal = tab.kind === "local";
 
   useEffect(() => {
@@ -619,9 +623,20 @@ export function TerminalView({
     // keys". So track what the app ASKED for and hand-encode wheel events to
     // the pty ourselves: the app gets native wheel scrolling, xterm never
     // activates mouse reporting, and drag-select keeps working.
+    // Synthesis is deliberately conservative: a wrong guess prints literal
+    // "64;46;24M" junk into the foreground app (seen 2026-08-13 after an app
+    // died holding mouse mode on). So we only synthesize when SGR (1006) is
+    // explicitly on AND a tracking mode is on, never legacy X10, and the
+    // remembered modes are dropped on alt-screen exit and session change —
+    // anything else degrades to xterm's arrow-key fallback, which is harmless.
     const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003, 1005, 1006, 1015]);
     const appMouseModes = new Set<number>();
     let sgrMouse = false;
+    const clearSyntheticMouse = () => {
+      appMouseModes.clear();
+      sgrMouse = false;
+    };
+    clearSyntheticMouseRef.current = clearSyntheticMouse;
     for (const final of ["h", "l"]) {
       term.parser.registerCsiHandler({ prefix: "?", final }, (params) => {
         if (!params.every((p) => typeof p === "number" && MOUSE_TRACKING_MODES.has(p))) {
@@ -635,9 +650,16 @@ export function TerminalView({
         return true;
       });
     }
+    // Leaving the alternate screen means the fullscreen app is done; whatever
+    // mouse modes it requested die with it. Apps that crash without DECRST
+    // would otherwise leave us spraying mouse reports at their successor.
+    const bufferChangeDisposable = term.buffer.onBufferChange((buf) => {
+      if (buf.type === "normal") clearSyntheticMouse();
+    });
     term.attachCustomWheelEventHandler((ev) => {
       if (
         appMouseModes.size === 0 ||
+        !sgrMouse ||
         ev.deltaY === 0 ||
         term.buffer.active.type !== "alternate"
       ) {
@@ -653,10 +675,7 @@ export function TerminalView({
       // deltaMode 1 = lines (real wheels, |delta|~3), 0 = pixels (trackpads).
       const magnitude = ev.deltaMode === 1 ? Math.abs(ev.deltaY) / 3 : Math.abs(ev.deltaY) / 40;
       const steps = Math.min(5, Math.max(1, Math.round(magnitude)));
-      const seq = sgrMouse
-        ? `\x1b[<${btn};${col};${row}M`
-        : `\x1b[M${String.fromCharCode(32 + btn)}${String.fromCharCode(32 + Math.min(col, 222))}${String.fromCharCode(32 + Math.min(row, 222))}`;
-      queueInput(sid, seq.repeat(steps));
+      queueInput(sid, `\x1b[<${btn};${col};${row}M`.repeat(steps));
       return false;
     });
     // OSC 52 is hostile by default. A host must be explicitly trusted, the
@@ -842,6 +861,7 @@ export function TerminalView({
         activeAgentTrailingHealTimer.current = null;
       }
       writeParsedDisposable.dispose();
+      bufferChangeDisposable.dispose();
       term.dispose();
       container.removeEventListener("focusin", focusHandler);
       termRef.current = null;
