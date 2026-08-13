@@ -37,6 +37,10 @@ grep -q "allowRemoteClipboardRef" "$TV" || err "OSC 52 handler no longer gated o
 # 4. Typing latency over SSH (2026-08-10): Nagle must stay off.
 grep -q "set_nodelay(true)" backend/src/ssh/mod.rs || err "TCP_NODELAY removed from SSH connect — Nagle adds 40ms+ keystroke stalls"
 
+# 5a. Local-path privacy (2026-08-13): release binaries embedded /Users/<name>
+#     panic paths 766x. The release build script must remap them away.
+grep -q "remap-path-prefix" package.json || err "tauri:build lost --remap-path-prefix — release binaries will embed local home paths"
+
 # 5. Supply-chain posture (CLAUDE.md §2.1): exact pins only, no lifecycle
 #    scripts in our own package.json.
 grep -nE '"[~^][0-9]' package.json && err "floating version range in package.json — exact pins only"

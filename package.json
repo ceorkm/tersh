@@ -16,7 +16,7 @@
     "preview": "vite preview --config frontend/vite.config.ts --configLoader runner",
     "tauri": "tauri --config backend/tauri.conf.json",
     "tauri:dev": "tauri dev --config backend/tauri.conf.json",
-    "tauri:build": "tauri build --config backend/tauri.conf.json",
+    "tauri:build": "RUSTFLAGS=\"--remap-path-prefix=$PWD=/src --remap-path-prefix=$HOME=/h\" tauri build --config backend/tauri.conf.json",
     "type-check": "tsc -p frontend/tsconfig.json --noEmit"
   },
   "dependencies": {
